@@ -219,3 +219,10 @@ gemini-auth.json.bak*
 # Bản clone profile Chrome (chứa cookie Google đã đăng nhập) - sinh ra tự động
 chrome-profile/
 chrome-profile-*/
+
+# Log runtime (logstore.py ghi ra đây); *.log đã có ở trên
+logs/
+
+# Python portable đi kèm repo (~50MB, không ai cần trong git)
+python_portable/
+venv*/

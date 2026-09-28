@@ -1001,6 +1001,24 @@ def resolve_profile(cfg_profile: str) -> tuple[str, str | None]:
 # =============================================================================
 # Giám hó (chạy trong event loop của server)
 # =============================================================================
+# `keep_alive` trong config chỉ được đọc một lần lúc khởi động, nên bảng điều
+# khiển không tắt được Chrome đang chạy nếu không có đường tắt riêng. Panel gọi
+# set_keep_alive() để chặn/tiếp tục giám hó ngay, và giá trị trong config giữ
+# nguyên làm mặc định cho lần khởi động sau (nên bấm "dừng" rồi khởi động lại
+# server thì Chrome vẫn được bật lại đúng như cấu hình).
+_keep_alive_override: bool | None = None
+
+
+def set_keep_alive(enabled: bool | None) -> None:
+    global _keep_alive_override
+    _keep_alive_override = enabled
+    log.info("keep_alive override -> %s", "config" if enabled is None else enabled)
+
+
+def _keep_alive(configured: bool) -> bool:
+    return configured if _keep_alive_override is None else _keep_alive_override
+
+
 async def browser_supervisor(browser_cfg: dict) -> None:
     """Clone -> launch -> giám hó Chrome ẩn để extension luôn đẩy cookie tươi."""
     if not browser_cfg.get("enabled", False):
@@ -1029,7 +1047,7 @@ async def browser_supervisor(browser_cfg: dict) -> None:
                     log.warning("Chưa tìm được profile mẫu để clone. %s", SETUP_HINT)
                     log.warning("Tự thử lại mỗi 30s; đóng Chrome đang mở profile mẫu cũng giúp.")
                     warned_no_profile = True
-                if not keep_alive:
+                if not _keep_alive(keep_alive):
                     return
                 await asyncio.sleep(30)
                 continue
@@ -1046,7 +1064,7 @@ async def browser_supervisor(browser_cfg: dict) -> None:
             # Profile mới vừa được Chrome tạo ra có thể chưa kịp có Secure
             # Preferences; kiểm tra lại thay vì bỏ cuộc vĩnh viễn.
             if not extension_installed_in(target.profile_dir, ext_dir):
-                if not keep_alive:
+                if not _keep_alive(keep_alive):
                     return
                 await asyncio.sleep(30)
                 continue
@@ -1064,7 +1082,7 @@ async def browser_supervisor(browser_cfg: dict) -> None:
                 waited_sync = True
                 await wait_for_auth(health_url, sync_timeout)
 
-        if keep_alive:
+        if _keep_alive(keep_alive):
             await asyncio.sleep(15)
         else:
             return

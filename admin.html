@@ -1,0 +1,673 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Lumi Agent - Bảng điều khiển</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel2: #1c232c; --line: #2a3038;
+    --text: #e6edf3; --muted: #8b949e; --accent: #4c8dff; --ok: #3fb950;
+    --warn: #d29922; --err: #f85149; --mono: ui-monospace, SFMono-Regular, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { display: flex; align-items: center; gap: 12px; padding: 12px 20px;
+           border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
+  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
+  .dot.bad { background: var(--err); box-shadow: 0 0 8px var(--err); }
+  .spacer { flex: 1; }
+  nav { display: flex; gap: 4px; padding: 10px 20px 0; border-bottom: 1px solid var(--line); background: var(--panel); }
+  nav button { background: none; border: none; color: var(--muted); padding: 9px 14px; cursor: pointer;
+               font-size: 14px; border-bottom: 2px solid transparent; border-radius: 6px 6px 0 0; }
+  nav button:hover { color: var(--text); background: #1f2630; }
+  nav button.on { color: var(--text); border-bottom-color: var(--accent); font-weight: 600; }
+  main { padding: 20px; max-width: 1180px; }
+  section { display: none; }
+  section.on { display: block; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 16px; margin-bottom: 16px; }
+  .card h2 { font-size: 14px; margin: 0 0 12px; text-transform: uppercase;
+             letter-spacing: .06em; color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+  .kv { display: flex; justify-content: space-between; gap: 10px; padding: 7px 0;
+        border-bottom: 1px dashed var(--line); }
+  .kv:last-child { border-bottom: none; }
+  .kv span:first-child { color: var(--muted); }
+  .kv span:last-child { font-family: var(--mono); font-size: 12px; text-align: right;
+                       word-break: break-all; }
+  label { display: block; margin-bottom: 12px; }
+  label > b { display: block; font-size: 12px; color: var(--muted); margin-bottom: 5px; font-weight: 500; }
+  input[type=text], input[type=number], input[type=password], select, textarea {
+    width: 100%; padding: 8px 10px; background: var(--bg); color: var(--text);
+    border: 1px solid var(--line); border-radius: 6px; font: 13px var(--mono); }
+  input:focus, select:focus, textarea:focus { outline: none; border-color: var(--accent); }
+  input[readonly] { color: var(--muted); background: #10151b; cursor: not-allowed; }
+  .hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .hint.locked { color: var(--warn); }
+  button.act { background: var(--panel2); color: var(--text); border: 1px solid var(--line);
+               padding: 8px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+  button.act:hover:not(:disabled) { border-color: var(--accent); }
+  button.act:disabled { opacity: .45; cursor: not-allowed; }
+  button.act.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.act.danger { border-color: #6e2b28; color: #ff8a80; }
+  button.act.danger:hover:not(:disabled) { border-color: var(--err); background: #2d1a19; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  pre { background: #080b0f; border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+        max-height: 62vh; overflow: auto; font: 12px/1.6 var(--mono); margin: 0; white-space: pre-wrap; }
+  .logline { border-bottom: 1px solid #12161c; }
+  .WARN { color: var(--warn); } .ERROR, .CRITICAL { color: var(--err); } .DEBUG { color: #6e7681; }
+  .gate { max-width: 460px; margin: 60px auto; }
+  #toast { position: fixed; right: 18px; bottom: 18px; background: var(--panel2);
+           border: 1px solid var(--line); border-left: 3px solid var(--accent);
+           padding: 11px 15px; border-radius: 8px; max-width: 420px; display: none;
+           box-shadow: 0 8px 28px rgba(0,0,0,.5); font-size: 13px; }
+  #toast.err { border-left-color: var(--err); }
+  #toast.ok { border-left-color: var(--ok); }
+  code { font-family: var(--mono); background: var(--panel2); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  ol { margin: 6px 0; padding-left: 22px; } ol li { margin: 4px 0; }
+  .path { font-family: var(--mono); font-size: 11px; color: var(--muted); word-break: break-all; }
+</style>
+</head>
+<body>
+
+<!-- Bước 0: nhập token. Chỉ hiện khi mở /admin trực tiếp mà không có #t=... -->
+<div id="gate" class="gate" style="display:none">
+  <div class="card">
+    <h2>Cần admin token</h2>
+    <p class="hint" style="margin-bottom:12px">
+      Mở panel từ icon trên system tray sẽ tự điền. Nếu mở bằng tay, dán token trong
+      <code>config.json</code> &rarr; <code>admin.token</code> vào đây. Token nằm trong
+      ô này, không ghi vào URL và không bị server ghi log.
+    </p>
+    <input type="password" id="tokenIn" placeholder="admin token" autocomplete="off">
+    <div class="row" style="margin-top:12px">
+      <button class="act primary" id="tokenGo">Vào</button>
+    </div>
+  </div>
+</div>
+
+<div id="app" style="display:none">
+  <header>
+    <div class="dot" id="hDot"></div>
+    <h1>Lumi Agent</h1>
+    <span class="hint" id="hModel"></span>
+    <div class="spacer"></div>
+    <span class="hint" id="hUptime"></span>
+  </header>
+  <nav>
+    <button data-tab="status" class="on">Trạng thái</button>
+    <button data-tab="config">Cấu hình</button>
+    <button data-tab="logs">Log</button>
+    <button data-tab="profile">Profile</button>
+    <button data-tab="server">Server</button>
+  </nav>
+
+  <main>
+    <section id="tab-status" class="on">
+      <div class="card">
+        <h2>Server</h2>
+        <div class="grid" id="sServer"></div>
+      </div>
+      <div class="card">
+        <h2>Gemini</h2>
+        <div class="grid" id="sGemini"></div>
+      </div>
+      <div class="card">
+        <h2>Chrome agent</h2>
+        <div class="grid" id="sBrowser"></div>
+      </div>
+    </section>
+
+    <section id="tab-config">
+      <div class="card" id="cBroken" style="display:none;border-color:#6e2b28">
+        <h2 style="color:#ff8a80">config.json đang không hợp lệ</h2>
+        <div class="hint" id="cBrokenMsg" style="color:#ff8a80"></div>
+        <div class="hint" style="margin-top:8px">
+          Sửa trực tiếp file <span class="path" id="cBrokenPath"></span> rồi bấm
+          &quot;Nạp lại&quot;. Trong lúc đó các trang khác của panel có thể báo lỗi.
+        </div>
+        <div class="row" style="margin-top:10px"><button class="act" id="cReload">Nạp lại</button></div>
+      </div>
+      <div class="card">
+        <h2>Thiết kế máy chủ</h2>
+        <div class="grid" id="cServer"></div>
+        <div class="row" style="margin-top:6px">
+          <button class="act primary" id="cSave">Lưu cấu hình</button>
+          <span class="hint" id="cMsg"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Chrome agent</h2>
+        <div class="grid" id="cBrowser"></div>
+        <div class="row" style="margin-top:6px">
+          <button class="act primary" id="cSave2">Lưu cấu hình</button>
+          <span class="hint" id="cMsg2"></span>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Bảo mật</h2>
+        <div class="grid" id="cSecurity"></div>
+        <div class="row" style="margin-top:6px">
+          <button class="act" id="rotKey">Đổi API key</button>
+          <button class="act danger" id="rotTok">Đổi admin token</button>
+          <span class="hint">Đổi API key làm mọi client đang cấu hình key cũ hỏng.</span>
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-logs">
+      <div class="card">
+        <h2>Log trực tiếp</h2>
+        <div class="row" style="margin-bottom:10px">
+          <span class="hint" id="logFile"></span>
+          <div class="spacer"></div>
+          <label style="margin:0"><input type="checkbox" id="logFollow" checked> Tự cuộn</label>
+          <button class="act" id="logClear">Xoá file log</button>
+        </div>
+        <pre id="logBox"></pre>
+        <div class="hint" style="margin-top:8px">
+          Cookie phiên Google và bearer token đã được che trước khi hiện ở đây.
+          File log trên đĩa vẫn giữ nguyên để chẩn đoán.
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-profile">
+      <div class="card">
+        <h2>Profile agent</h2>
+        <div class="grid" id="pInfo"></div>
+        <div class="row" style="margin-top:14px">
+          <button class="act" id="bStart">Khởi động Chrome</button>
+          <button class="act" id="bRestart">Khởi động lại Chrome</button>
+          <button class="act" id="bStop">Dừng Chrome</button>
+          <div class="spacer"></div>
+          <button class="act" id="bSetup">Mở Chrome để cài extension</button>
+          <button class="act danger" id="bReset">Xoá profile &amp; đổi tài khoản</button>
+        </div>
+        <div class="hint" style="margin-top:10px" id="pHint"></div>
+      </div>
+      <div class="card">
+        <h2>Hướng dẫn cài extension</h2>
+        <ol class="hint" id="pSteps">
+          <li>Bấm <b>Mở Chrome để cài extension</b> (Chrome hiện ra ở <code>chrome://extensions</code>).</li>
+          <li>Bật <b>Developer mode</b> ở góc trên bên phải.</li>
+          <li>Bấm <b>Load unpacked</b> rồi chọn thư mục <span class="path" id="pExt"></span></li>
+          <li>Mở <code>gemini.google.com</code> và đăng nhập Google <b>trong đúng profile này</b>.</li>
+          <li>Đóng Chrome. Bấm <b>Khởi động Chrome</b> là xong - không cần mở cửa sổ nữa.</li>
+        </ol>
+        <div class="hint" style="margin-top:8px">
+          Đây là bản sao profile riêng của Lumi, không dùng Chrome cá nhân. Server
+          cũng không bao giờ đụng vào Chrome cá nhân.
+        </div>
+      </div>
+    </section>
+
+    <section id="tab-server">
+      <div class="card">
+        <h2>Điều khiển server</h2>
+        <div class="row">
+          <button class="act" id="srvRestart">Khởi động lại server</button>
+          <button class="act danger" id="srvStop">Tắt server</button>
+        </div>
+        <div class="hint" style="margin-top:10px" id="srvNote"></div>
+      </div>
+      <div class="card">
+        <h2>Dùng như OpenAI client</h2>
+        <div class="grid" id="sUsage"></div>
+        <div class="hint" style="margin-top:10px">
+          Trỏ base URL của client OpenAI (Cherry Studio, Open WebUI, SDK...) vào địa
+          chỉ dưới rồi dùng API key trong ô Cấu hình.
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+// Token đến trong fragment (#t=...) vì fragment KHÔNG BAO GIỜ được gửi lên server,
+// nên nó không nằm trong access log. Đọc xong xoá ngay bằng replaceState.
+let TOKEN = "";
+const HASH = new URLSearchParams(location.hash.slice(1));
+if (HASH.get("t")) {
+  TOKEN = HASH.get("t");
+  history.replaceState(null, "", location.pathname);
+} else if (location.hash.includes("t=")) {
+  // Dạng #token=... do bản cũ dùng.
+  TOKEN = decodeURIComponent(location.hash.split("t=")[1] || "");
+  history.replaceState(null, "", location.pathname);
+}
+
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g,
+  (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+function toast(msg, kind) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = kind || "";
+  t.style.display = "block";
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { t.style.display = "none"; }, 6000);
+}
+
+async function api(path, opts) {
+  const o = Object.assign({ headers: {} }, opts || {});
+  o.headers["X-Lumi-Admin"] = TOKEN;
+  if (o.body) o.headers["Content-Type"] = "application/json";
+  const res = await fetch("/admin/api" + path, o);
+  if (res.status === 401) {
+    $("app").style.display = "none";
+    $("gate").style.display = "block";
+    throw new Error("Token sai hoặc hết hạn.");
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || ("HTTP " + res.status));
+  return data;
+}
+
+// ---------- Booting ----------
+async function boot() {
+  if (!TOKEN) { $("gate").style.display = "block"; return; }
+  try {
+    await refreshStatus();
+  } catch (e) {
+    if (/Token sai/.test(e.message)) return;
+    toast(e.message, "err");
+  }
+  $("gate").style.display = "none";
+  $("app").style.display = "block";
+  await loadConfig();
+  await loadProfiles();
+  $("srvNote").textContent = state.supervised
+    ? "Server đang chạy dưới tray.py nên khởi động lại/tắt sẽ được tray xử lý."
+    : "Không chạy dưới tray.py: nút khởi động lại sẽ báo lỗi. Chạy `python tray.py` để có đầy đủ tính năng.";
+  $("srvRestart").disabled = !state.supervised;
+  $("srvStop").disabled = !state.supervised;
+  // Không await: startLogStream() chạy tới khi đóng luồng, await sẽ chặn phần
+  // còn lại của boot().
+  startLogStream().catch((e) => { $("logFile").textContent = e.message; });
+}
+
+$("tokenGo").onclick = () => {
+  TOKEN = $("tokenIn").value.trim();
+  if (TOKEN) { sessionStorage.setItem("lumi_admin", TOKEN); boot(); }
+};
+try { sessionStorage.setItem("lumi_admin", TOKEN); } catch (e) {}
+if (!TOKEN) TOKEN = sessionStorage.getItem("lumi_admin") || "";
+
+// ---------- Tabs ----------
+document.querySelectorAll("nav button").forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll("nav button").forEach((x) => x.classList.remove("on"));
+    document.querySelectorAll("section").forEach((s) => s.classList.remove("on"));
+    b.classList.add("on");
+    $("tab-" + b.dataset.tab).classList.add("on");
+    if (b.dataset.tab === "profile") loadProfiles();
+  };
+});
+
+// ---------- Trạng thái ----------
+let state = {};
+function kvHtml(pairs) {
+  return pairs.map(([k, v]) =>
+    '<div class="kv"><span>' + esc(k) + "</span><span>" + esc(v) + "</span></div>").join("");
+}
+function humanAge(sec) {
+  if (sec == null) return "chưa có";
+  if (sec < 60) return Math.round(sec) + " giây";
+  if (sec < 3600) return Math.round(sec / 60) + " phút";
+  if (sec < 86400) return Math.round(sec / 3600) + " giờ";
+  return Math.round(sec / 86400) + " ngày";
+}
+function humanUptime(sec) {
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600),
+        m = Math.floor((sec % 3600) / 60);
+  if (d) return d + " ngày " + h + " giờ";
+  if (h) return h + " giờ " + m + " phút";
+  return m + " phút";
+}
+
+async function refreshStatus() {
+  state = await api("/state");
+  const c = state.config || {};
+  const ok = (state.status === "ok");
+  $("hDot").className = "dot " + (ok ? "ok" : "bad");
+  $("hModel").textContent = c.model || "";
+  $("hUptime").textContent = "chạy " + humanUptime(state.process.uptime_sec);
+
+  $("sServer").innerHTML = kvHtml([
+    ["Trạng thái", ok ? "OK" : (state.status || "unknown")],
+    ["Địa chỉ", c.host + ":" + c.port],
+    ["Model", c.model],
+    ["Account", state.account_status || "?"],
+    ["Cookie mới nhất", humanAge(state.auth_age_sec)],
+    ["Client sẵn sàng", state.client_ready ? "có" : "chưa"],
+    ["Request đang chạy", state.in_flight || 0],
+    ["Hàng đợi", (state.queued || 0) + " / " + (state.queue_limit || "?")],
+    ["Admin", c.admin_enabled ? "bật" : "tắt"],
+  ]);
+
+  $("sGemini").innerHTML = kvHtml([
+    ["Model đang phục vụ", state.active_model || c.model],
+    ["Danh sách model", (state.models || []).join(", ") || "-"],
+    ["Lỗi gần nhất", state.last_error || "không có"],
+    ["Số lần lỗi", state.error_count || 0],
+  ]);
+
+  const b = state.browser || {};
+  $("sBrowser").innerHTML = kvHtml([
+    ["Đang bật", b.enabled ? "có" : "không"],
+    ["Profile", b.profile || "-"],
+    ["Extension", b.ext_usable ? "đã cài, chạy được" : (b.ext_reason || "chưa cài")],
+    ["Cookie trong DB", b.cookies_db_bytes
+        ? Math.round(b.cookies_db_bytes / 1024) + " KB" : "chưa có"],
+  ]);
+
+  $("sUsage").innerHTML = kvHtml([
+    ["Base URL", window.location.origin + "/v1"],
+    ["API key", c.api_key_masked || "(chưa có)"],
+    ["Model", c.model],
+    ["Trang panel", window.location.origin + "/admin"],
+  ]);
+}
+
+// ---------- Cấu hình ----------
+// Mỗi field: [key, nhãn, loại, gợi ý, nhóm]. Loại "" nghĩa là text.
+const FIELDS_SERVER = [
+  ["host", "Host", "", "127.0.0.1 = chỉ máy này. 0.0.0.0 để LAN truy cập - xem mục Server.", "server"],
+  ["port", "Port", "number", "", "server"],
+  ["model", "Model", "", "", "server"],
+  ["api_key", "API key", "password", "", "security"],
+  ["auth_file", "File phiên đồng bộ", "", "", "security"],
+  ["proxy", "Proxy", "", "Socks5://127.0.0.1:1080 hoặc http://...", "server"],
+  ["timeout", "Timeout (giây)", "number", "Tăng nếu câu hỏi dài hay bị timeout.", "server"],
+  ["retries", "Số lần thử lại", "number", "", "server"],
+  ["refresh_interval", "Làm mới model (giây)", "number", "", "server"],
+  ["healer_interval", "Bộ chữa Chrome (giây)", "number", "0 = tắt", "server"],
+  ["max_concurrent", "Số request đồng thời", "number", "", "server"],
+  ["max_queue", "Hàng đợi tối đa", "number", "", "server"],
+  ["queue_timeout", "Chờ hàng đợi (giây)", "number", "", "server"],
+  ["reload_cooldown", "Nghỉ giữa 2 lần reload (giây)", "number", "", "server"],
+  ["drain_grace", "Chờ request dở (giây)", "number", "", "server"],
+  ["admin.enabled", "Cho phép bảng điều khiển", "bool", "Tắt thì /admin trả 404.", "security"],
+];
+const FIELDS_BROWSER = [
+  ["browser.enabled", "Tự mở Chrome agent", "bool", "", "browser"],
+  ["browser.hidden", "Cách chạy", "select", "offscreen = ẩn khỏi taskbar nhưng vẫn chạy ngầm", "browser"],
+  ["browser.keep_alive", "Giữ Chrome luôn chạy", "bool", "Tắt thì không tự mở lại khi Chrome tự tắt.", "browser"],
+  ["browser.close_on_exit", "Đóng Chrome khi tắt server", "bool", "", "browser"],
+  ["browser.user_data_dir", "Thư mục dữ liệu", "", "Phải là thư mục riêng, KHÔNG phải User Data của Chrome cá nhân.", "browser"],
+  ["browser.profile_directory", "Tên profile", "", "", "browser"],
+  ["browser.chrome_path", "Đường dẫn chrome.exe", "", "Để trống thì tự tìm.", "browser"],
+  ["browser.close_timeout", "Chờ đóng Chrome (giây)", "number", "Lớn hơn để Chrome kịp tắt mềm và giữ extension.", "browser"],
+  ["browser.gemini_url", "URL Gemini", "", "", "browser"],
+  ["browser.sync_timeout", "Chờ extension đẩy cookie (giây)", "number", "", "browser"],
+  ["extension.bootstrap", "Bootstrap extension qua HTTP", "bool", "", "browser"],
+];
+let current = {};
+
+function fieldHtml(key, type, hint, locked) {
+  const raw = readPath(current, key);
+  const id = "f_" + key.replace(/\./g, "_");
+  const common = 'id="' + id + '" data-key="' + esc(key) + '" ' +
+    (locked ? "readonly " : "") +
+    'placeholder="(chưa có)"';
+  let inp;
+  if (type === "bool") {
+    inp = '<input type="checkbox" ' + common + (raw ? "checked" : "") + ">";
+  } else if (type === "select") {
+    inp = '<select ' + common + ">" +
+      ["offscreen", "headless", "visible"].map((v) =>
+        '<option value="' + v + '"' + (raw === v ? " selected" : "") + ">" + v + "</option>").join("") +
+      "</select>";
+  } else {
+    inp = '<input type="' + (type || "text") + '" ' + common +
+      (type === "number" ? ' step="1" ' : "") +
+      'value="' + esc(raw == null || raw === "" ? "" : String(raw)) + '">';
+  }
+  return "<label><b>" + esc(key) + "</b>" + inp +
+    '<div class="hint' + (locked ? " locked" : "") + '">' +
+    (locked ? "Đang bị env ghi đè, không sửa được từ đây. " : "") + esc(hint) + "</div></label>";
+}
+function readPath(obj, path) {
+  return path.split(".").reduce((o, k) => (o == null ? o : o[k]), obj);
+}
+function writePath(obj, path, value) {
+  const keys = path.split(".");
+  let o = obj;
+  while (keys.length > 1) {
+    if (typeof o[keys[0]] !== "object" || o[keys[0]] === null) o[keys[0]] = {};
+    o = o[keys[0]];
+    keys.shift();
+  }
+  o[keys[0]] = value;
+}
+function renderFields(list) {
+  const locked = state.locked_fields || [];
+  return list.map(([key, , type, hint]) => fieldHtml(key, type, hint, locked.includes(key))).join("");
+}
+
+async function loadConfig() {
+  const d = await api("/config");
+  current = d.config;
+  $("cServer").innerHTML = renderFields(FIELDS_SERVER);
+  $("cBrowser").innerHTML = renderFields(FIELDS_BROWSER);
+  $("cSecurity").innerHTML = "";
+  const broken = d.valid === false;
+  $("cBroken").style.display = broken ? "block" : "none";
+  $("cReload").style.display = broken ? "inline-block" : "none";
+  if (broken) {
+    $("cBrokenMsg").textContent = d.error || "Không rõ lý do";
+    $("cBrokenPath").textContent = d.path || "";
+  }
+}
+$("cReload").onclick = () => { loadConfig().catch((e) => toast(e.message, "err")); };
+
+async function saveFields(group) {
+  const list = group === "browser" ? FIELDS_BROWSER : FIELDS_SERVER;
+  const patch = {};
+  list.forEach(([key]) => {
+    const el = document.querySelector('[data-key="' + key + '"]');
+    if (!el || el.readOnly) return;
+    let v;
+    if (el.type === "checkbox") v = el.checked;
+    else if (el.type === "number") v = el.value === "" ? null : Number(el.value);
+    else v = el.value;
+    const before = readPath(current, key);
+    if (JSON.stringify(v) !== JSON.stringify(before)) writePath(patch, key, v);
+  });
+  const msg = group === "browser" ? $("cMsg2") : $("cMsg");
+  if (!Object.keys(patch).length) { msg.textContent = "Không có gì thay đổi."; return; }
+  try {
+    const d = await api("/config", { method: "PATCH", body: JSON.stringify({ patch }) });
+    current = d.config;
+    state.locked_fields = d.locked_fields;
+    let m = "Đã lưu.";
+    if (d.restart_required.length) {
+      m += " Cần khởi động lại server cho: " + d.restart_required.join(", ") + ".";
+    }
+    msg.textContent = m;
+    toast(m, "ok");
+    loadConfig();
+    refreshStatus().catch(() => {});
+  } catch (e) { msg.textContent = e.message; toast(e.message, "err"); }
+}
+$("cSave").onclick = () => saveFields("server");
+$("cSave2").onclick = () => saveFields("browser");
+
+$("rotKey").onclick = async () => {
+  if (!confirm("Đổi API key? Mọi client đang dùng key cũ sẽ hỏng.")) return;
+  try {
+    const d = await api("/config/rotate", { method: "POST", body: JSON.stringify({ which: "api_key" }) });
+    current = d.config; loadConfig(); toast("Đã đổi API key. Cần khởi động lại server.", "ok");
+  } catch (e) { toast(e.message, "err"); }
+};
+$("rotTok").onclick = async () => {
+  if (!confirm("Đổi admin token? Panel đang mở sẽ phải nhập lại token.")) return;
+  try {
+    await api("/config/rotate", { method: "POST", body: JSON.stringify({ which: "admin_token" }) });
+    TOKEN = "";
+    $("app").style.display = "none";
+    $("gate").style.display = "block";
+    $("tokenIn").value = "";
+    toast("Đã đổi token. Mở lại panel từ icon trên tray.", "ok");
+  } catch (e) { toast(e.message, "err"); }
+};
+
+// ---------- Log ----------
+let logAbort = null;
+const box = $("logBox");
+function addLines(lines) {
+  if (!lines.length) return;
+  box.insertAdjacentHTML("beforeend",
+    lines.map((l) => {
+      const cls = l.includes("| ERROR") ? "ERROR" : l.includes("| WARNING") ? "WARN" : "";
+      return '<div class="logline ' + cls + '">' + esc(l) + "</div>";
+    }).join(""));
+  while (box.childElementCount > 3000) box.removeChild(box.firstChild);
+  if ($("logFollow").checked) box.scrollTop = box.scrollHeight;
+}
+async function startLogStream() {
+  const d = await api("/logs?lines=300");
+  $("logFile").textContent = d.file || "(chưa có file log)";
+  box.textContent = "";
+  addLines(d.lines);
+
+  if (logAbort) logAbort.abort();
+  logAbort = new AbortController();
+  // Dùng fetch + ReadableStream thay vì EventSource: EventSource không set được
+  // header, nên token sẽ phải nằm trong query string và rơi vào access log của
+  // uvicorn. Cách này giữ token trong header như phần còn lại của panel.
+  const res = await fetch("/admin/api/logs/stream", {
+    headers: { "X-Lumi-Admin": TOKEN },
+    signal: logAbort.signal,
+  });
+  if (res.status === 401) { $("app").style.display = "none"; $("gate").style.display = "block"; return; }
+  if (!res.ok || !res.body) throw new Error("Không mở được luồng log (HTTP " + res.status + ")");
+  $("logFile").textContent = d.file + "  •  đang theo dõi trực tiếp";
+  const reader = res.body.getReader();
+  const dec = new TextDecoder();
+  let buf = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    // Khung SSE phân tách bằng dòng trống; ": ping"/": connected" là comment.
+    const frames = buf.split("\n\n");
+    buf = frames.pop();
+    const out = [];
+    for (const f of frames) {
+      for (const line of f.split("\n")) {
+        if (line.startsWith("data: ")) out.push(line.slice(6));
+      }
+    }
+    addLines(out);
+  }
+  // Server vừa restart (hoặc rớt kết nối): nối lại sau 3 giây. Không nối lại vô
+  // hạn khi panel đã đóng tab - abort sẽ làm reader.read() ném lỗi.
+  await new Promise((r) => setTimeout(r, 3000));
+  if (logAbort && !logAbort.signal.aborted) startLogStream().catch(() => {});
+}
+$("logClear").onclick = async () => {
+  if (!confirm("Xoá toàn bộ file log?")) return;
+  try { await api("/logs/clear", { method: "POST" }); box.textContent = ""; toast("Đã xoá log.", "ok"); }
+  catch (e) { toast(e.message, "err"); }
+};
+
+// ---------- Profile ----------
+async function loadProfiles() {
+  let d;
+  try { d = await api("/profiles"); }
+  catch (e) { $("pInfo").innerHTML = kvHtml([["Lỗi", e.message]]); return; }
+  if (d.error) { $("pInfo").innerHTML = kvHtml([["Lỗi", d.error]]); return; }
+  const a = d.agent || {};
+  const x = a.extension || {};
+  $("pInfo").innerHTML = kvHtml([
+    ["Tên profile", a.profile || "-"],
+    ["Thư mục", a.profile_dir || "-"],
+    ["Profile tồn tại", a.exists ? "có" : "chưa (Chrome sẽ tự tạo)"],
+    ["Extension", x.usable ? "đã cài" : (x.reason || "chưa cài")],
+    ["Cookie trong DB", a.cookies_db_bytes ? Math.round(a.cookies_db_bytes / 1024) + " KB" : "chưa có"],
+    ["Tiến trình Chrome", (a.running_pids || []).join(", ") || "chưa chạy"],
+    ["gemini-auth.json", a.auth_file_exists ? "có" : "chưa có"],
+  ]);
+  $("pExt").textContent = d.extension_dir || "";
+  $("pHint").textContent = x.usable
+    ? "Extension đã sẵn sàng. Nếu cookie vẫn cũ, thử nút khởi động lại Chrome."
+    : "Chưa có extension chạy được. Làm theo hướng dẫn bên dưới.";
+  const running = (a.running_pids || []).length > 0;
+  $("bStop").disabled = !running;
+  $("bRestart").disabled = !running;
+  $("bStart").disabled = running;
+}
+
+function browserAction(path, okMsg) {
+  return async () => {
+    try {
+      const d = await api(path, { method: "POST" });
+      toast(d.status === "already-running" ? "Chrome đang chạy rồi." : okMsg, "ok");
+      loadProfiles();
+    } catch (e) { toast(e.message, "err"); }
+  };
+}
+$("bStart").onclick = browserAction("/browser/start", "Đã mở Chrome agent.");
+$("bStop").onclick = browserAction("/browser/stop", "Đã đóng Chrome agent.");
+$("bRestart").onclick = browserAction("/browser/restart", "Đã khởi động lại Chrome agent.");
+$("bSetup").onclick = async () => {
+  try {
+    const d = await api("/browser/setup", { method: "POST" });
+    toast("Đã mở Chrome ở " + d.profile + ". " + d.steps[0], "ok");
+    $("pHint").textContent = "Đang chờ bạn cài extension trong cửa sổ Chrome vừa mở...";
+    pollSetup();
+  } catch (e) { toast(e.message, "err"); }
+};
+// Poll tới khi extension sẵn sàng thì dừng, tối đa 5 phút.
+let pollCount = 0;
+function pollSetup() {
+  clearTimeout(pollSetup._t);
+  if (++pollCount > 60) { $("pHint").textContent = "Hết thời gian chờ. Nạp extension xong bấm Khởi động lại Chrome."; return; }
+  pollSetup._t = setTimeout(async () => {
+    await loadProfiles();
+    if (($("pHint").textContent || "").indexOf("Extension đã sẵn sàng") === 0) {
+      toast("Extension đã sẵn sàng.", "ok");
+    } else { pollSetup(); }
+  }, 5000);
+}
+$("bReset").onclick = async () => {
+  if (!confirm("Xoá toàn bộ profile agent và gemini-auth.json?\n" +
+               "Bạn sẽ phải đăng nhập Google lại. Cần nhập 'xoa' để xác nhận.")) return;
+  const typed = prompt("Nhập chữ 'xoa' để xác nhận xoá profile:");
+  if (typed == null) return;
+  try {
+    const d = await api("/browser/reset", { method: "POST", body: JSON.stringify({ confirm: typed }) });
+    toast("Đã xoá " + d.removed.length + " mục. " + d.next[0], "ok");
+    loadProfiles();
+  } catch (e) { toast(e.message, "err"); }
+};
+
+// ---------- Server ----------
+$("srvRestart").onclick = async () => {
+  if (!confirm("Khởi động lại server? Sẽ có 2-3 giây không phục vụ.")) return;
+  try { await api("/server/restart", { method: "POST" }); toast("Đang khởi động lại...", "ok"); }
+  catch (e) { toast(e.message, "err"); }
+};
+$("srvStop").onclick = async () => {
+  if (!confirm("Tắt server? Sẽ phải mở lại từ icon trên tray.")) return;
+  try { await api("/server/stop", { method: "POST" }); toast("Đang tắt server.", "ok"); }
+  catch (e) { toast(e.message, "err"); }
+};
+
+// Trạng thái làm mới mỗi 5s nhưng dừng khi tab đang ẩn để không đốt CPU.
+setInterval(() => { if (!document.hidden) refreshStatus().catch(() => {}); }, 5000);
+boot();
+</script>
+</body>
+</html>

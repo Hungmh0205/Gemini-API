@@ -34,6 +34,7 @@ import re
 import secrets
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager, suppress
@@ -58,7 +59,29 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | 
 set_log_level("WARNING")
 
 BASE_DIR = Path(__file__).resolve().parent
-CONFIG_FILE = BASE_DIR / "config.json"
+
+# python_portable chạy với file `._pth`, nên thư mục script KHÔNG tự nằm trong
+# sys.path. Phải tự thêm trước khi import module cùng thư mục.
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+import chrome_launcher
+from chrome_launcher import (
+    browser_supervisor,
+    close_agent_chrome,
+    extension_registration,
+    resolve_agent_profile,
+    user_data_root,
+)
+
+import admin_api
+import config_store
+import logstore
+
+# Qua config_store để LUMI_CONFIG có tác dụng. Trước đây file này tự chỉ định
+# BASE_DIR/"config.json", nên LUMI_CONFIG bị bỏ qua: instance test lấn sang config
+# thật, đọc gemini-auth.json thật và chiếm cổng của server đang chạy.
+CONFIG_FILE = config_store.config_path()
 
 
 def _load_config() -> dict:
@@ -70,6 +93,25 @@ def _load_config() -> dict:
         return {}
     except json.JSONDecodeError as e:
         raise RuntimeError(f"Invalid config.json: {e}") from e
+
+
+def log_settings(cfg: dict) -> dict:
+    """Cài đặt file log, đọc đúng section `logging` của config.json.
+
+    Tách riêng thành hàm thuần để test được: `server.py` đọc dict thô của
+    config.json, mà `config_store.LoggingConfig` đặt đường dẫn ở
+    `logging.file`. Trước đây code lấy `CONFIG.get("log_file")` ở cấp gốc nên
+    giá trị luôn rỗng, server lặng lẽ ghi `logs/lumi.log` và bỏ qua mọi thiết
+    lập của người dùng - kể cả thiết lập từ panel.
+    """
+    log_cfg = cfg.get("logging") or {}
+    return {
+        "enabled": log_cfg.get("enabled") is not False,
+        "file": os.getenv("LUMI_LOG_FILE") or log_cfg.get("file") or "logs/lumi.log",
+        "level": os.getenv("LUMI_LOG_LEVEL") or log_cfg.get("level") or "INFO",
+        "max_bytes": int(log_cfg.get("max_bytes") or 2_000_000),
+        "backups": int(log_cfg.get("backups") or 3),
+    }
 
 
 CONFIG = _load_config()
@@ -88,17 +130,18 @@ QUEUE_TIMEOUT = float(os.getenv("GEMINI_QUEUE_TIMEOUT") or CONFIG.get("queue_tim
 RELOAD_COOLDOWN = float(os.getenv("GEMINI_RELOAD_COOLDOWN") or CONFIG.get("reload_cooldown") or 5)
 DRAIN_GRACE = float(os.getenv("GEMINI_DRAIN_GRACE") or CONFIG.get("drain_grace") or 30)
 
-if str(BASE_DIR) not in sys.path:
-    sys.path.insert(0, str(BASE_DIR))
-from chrome_launcher import (
-    browser_supervisor,
-    close_agent_chrome,
-    resolve_agent_profile,
-    user_data_root,
-)
-
 BROWSER = CONFIG.get("browser") or {}
 EXTENSION = CONFIG.get("extension") or {}
+
+LOG = log_settings(CONFIG)
+LOG_CFG = CONFIG.get("logging") or {}
+LOG_LEVEL = LOG["level"]
+ADMIN_CFG = CONFIG.get("admin") or {}
+# Panel là giao diện điều khiển cục bộ có quyền đọc/ghi config và chạy taskkill, nên
+# nó có token riêng, KHÔNG dùng chung API key. Mặc định bật để panel dùng được
+# ngay; nếu chưa có token thì mọi route /admin/api trả 404 (xem admin_api).
+ADMIN_ENABLED = ADMIN_CFG.get("enabled", True) is not False
+ADMIN_TOKEN = str(ADMIN_CFG.get("token") or "").strip()
 # Extension cần API key để gọi /v1/auth/sync, nhưng lấy key thì chưa có gì để chứng
 # minh. Endpoint này trả cho extension chạy cùng máy. Tắt bằng
 # config.json -> "extension": {"bootstrap": false}.
@@ -110,6 +153,14 @@ CLOSE_ON_EXIT = BROWSER.get("close_on_exit", True) is not False
 CLOSE_TIMEOUT = float(os.getenv("GEMINI_CLOSE_TIMEOUT") or BROWSER.get("close_timeout") or 25)
 
 LOOPBACK_HOSTS = {"127.0.0.1", "::1", "localhost", "testclient"}
+
+# Mã thoát để tray.py phân biệt "restart có chủ đích" với "crash". Trùng với
+# EX_TEMPFAIL của sysexits.h, và cũng trùng với RESTART_EXIT trong tray.py.
+RESTART_EXIT = 75
+# Mã thoát khi panel bấm "Dừng server". Cần mã riêng vì cảnh báo chung với
+# restart là "crash": nếu không, supervisor sẽ bật lại đúng cái server mà
+# người dùng vừa yêu cầu tắt, và nút "Dừng server" trên menu tray vô hiệu.
+STOP_EXIT = 76  # EX_PROTOCOL của sysexits.h
 
 
 def _is_extension_client(request: Request, origin: str) -> bool:
@@ -525,6 +576,58 @@ def _same_path(a: str, b: str) -> bool:
     return n(a) == n(b)
 
 
+def _start_parent_watchdog() -> None:
+    """Tự thoát nếu tiến trình cha (tray) chết, khi đang chạy dưới supervision.
+
+    Vấn đề: tray bị `taskkill /F` hoặc treo máy thì server con sống tiếp, giữ cổng
+    và chạy ngoài tầm tay ai. Lần `tray.py` sau sẽ phải giành lại nó, và không ai
+    dừng được nó ngoài việc vào panel.
+
+    Không dùng `os.getppid()`: trên Windows giá trị này được cache lúc khởi tạo và
+    không đổi khi cha chết. Phải mở handle thật tới tiến trình cha rồi chờ trên
+    handle đó. Chỉ bật khi `LUMI_SUPERVISED=1` (tức là do tray sinh ra), và chỉ khi
+    mở handle thành công — không mở được thì thà không canh còn hơn tự giết mình nhầm.
+    """
+    if os.name != "nt" or os.getenv("LUMI_SUPERVISED") != "1":
+        return
+    import ctypes
+    import ctypes.wintypes as wintypes
+
+    SYNCHRONIZE = 0x00100000
+    WAIT_OBJECT_0 = 0x00000000
+    WAIT_TIMEOUT = 0x00000102
+    PROCESS_QUERY_LIMITED = 0x1000
+    parent_pid = os.getppid()
+
+    def _thread() -> None:
+        handle = None
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = wintypes.HANDLE
+            handle = k32.OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED, False, parent_pid)
+            if not handle:
+                return
+            while True:
+                rc = k32.WaitForSingleObject(handle, 5000)
+                if rc == WAIT_TIMEOUT:
+                    continue
+                if rc != WAIT_OBJECT_0:
+                    return
+                logging.error("Tiến trình quản lý (tray, pid=%s) đã chết - tự thoát.",
+                              parent_pid)
+                os._exit(0)
+        except Exception:
+            return
+        finally:
+            if handle:
+                try:
+                    ctypes.WinDLL("kernel32").CloseHandle(handle)
+                except Exception:
+                    pass
+
+    threading.Thread(target=_thread, name="parent-watchdog", daemon=True).start()
+
+
 async def _shutdown_agent_browser(browser_cfg: dict) -> None:
     """Tắt Chrome agent khi server dừng (Ctrl+C).
 
@@ -585,6 +688,14 @@ async def _shutdown_agent_browser(browser_cfg: dict) -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     global client, _client_lock, _guard
+    # uvicorn tự cấu hình logging trong Server.run(), tức là SAU main() gọi
+    # logstore.install(). Nên phải gắn nốt handler vào logger của uvicorn ở đây.
+    logstore.attach_uvicorn(LOG_LEVEL)
+    if ADMIN_ENABLED and not ADMIN_TOKEN:
+        logging.error(
+            "admin.enabled=true nhưng admin.token rỗng -> /admin sẽ trả 404. "
+            "Chạy `python server.py --gen-admin-token` để sinh token."
+        )
     _client_lock = asyncio.Lock()
     _guard = _ConcurrencyGuard(MAX_CONCURRENT, MAX_QUEUE, QUEUE_TIMEOUT)
     logging.info(
@@ -629,6 +740,78 @@ app = FastAPI(
     openapi_url=None,
     lifespan=lifespan,
 )
+
+
+def _auth_age_sec() -> float | None:
+    try:
+        mtime = AUTH_FILE.stat().st_mtime
+    except OSError:
+        return None
+    return round(time.time() - mtime, 1)
+
+
+def _agent_brief() -> dict:
+    """Tình trạng Chrome agent cho thẻ "Chrome agent" ở tab Trạng thái.
+
+    Cố tình KHÔNG gọi `browser_pids()` ở đây: nó chạy WMI (spawn tiến trình
+    PowerShell), mà `/api/state` bị panel poll mỗi 5 giây. Số tiến trình nằm ở
+    `/admin/api/profiles` - chỉ tải khi mở tab Profile.
+    """
+    if not BROWSER.get("enabled"):
+        return {"enabled": False}
+    out: dict = {"enabled": True, "health_url": BROWSER.get("health_url") or f"{_base_url()}/health"}
+    try:
+        target = resolve_agent_profile(BROWSER)
+        ext_dir = str(BROWSER.get("ext_dir") or chrome_launcher.EXT_DIR)
+        info = extension_registration(target.profile_dir, ext_dir)
+        cookies = os.path.join(target.profile_dir, "Network", "Cookies")
+        out.update({
+            "profile": target.name,
+            "profile_dir": target.profile_dir,
+            "ext_usable": bool(info.get("usable")),
+            "ext_reason": info.get("reason"),
+            "cookies_db_bytes": os.path.getsize(cookies) if os.path.isfile(cookies) else 0,
+        })
+    except Exception as e:  # thông tin phụ, không được làm hỏng cả panel
+        out["ext_reason"] = str(e)
+    return out
+
+
+def _admin_state() -> dict:
+    """Phần trạng thái mà admin_api không tự biết được (nó không import server.py
+    để tránh vòng lặp import)."""
+    return {
+        "status": "ok" if client_ready else "unauthenticated",
+        "model": DEFAULT_MODEL,
+        "active_model": getattr(client, "model", None) or DEFAULT_MODEL,
+        "models": sorted(_known_models()),
+        "client_ready": bool(client_ready),
+        # Tên thuộc tính private vì _ConcurrencyGuard chỉ cần chúng ở bên trong;
+        # đọc từ ngoài thì getattr với default để đỡi một bản server cũ hơn.
+        "in_flight": getattr(_guard, "_active", 0) or 0,
+        "queued": getattr(_guard, "_waiters", 0) or 0,
+        "queue_limit": MAX_QUEUE,
+        "account_status": client.account_status.name if client else None,
+        "auth_age_sec": _auth_age_sec(),
+        "browser": _agent_brief(),
+    }
+
+
+if ADMIN_ENABLED and ADMIN_TOKEN:
+    admin_api.configure(ADMIN_TOKEN, _base_url(), CONFIG_FILE)
+    admin_api.HOOK.state_provider = _admin_state
+    app.include_router(admin_api.router)
+    logging.info("Admin panel: %s/admin", _base_url())
+else:
+    logging.info("Admin panel: tắt (bật bằng config.json -> admin.enabled + admin.token)")
+
+
+def _auth_age_sec() -> float | None:
+    try:
+        mtime = AUTH_FILE.stat().st_mtime
+    except OSError:
+        return None
+    return round(time.time() - mtime, 1)
 
 
 def require_key(
@@ -818,16 +1001,12 @@ async def index():
 
 @app.get("/health")
 async def health():
-    try:
-        mtime = AUTH_FILE.stat().st_mtime
-    except OSError:
-        mtime = 0.0
     return {
         "status": "ok" if client_ready else "unauthenticated",
         "model": DEFAULT_MODEL,
         "cookie_source": "extension",
         "account_status": client.account_status.name if client else None,
-        "auth_age_sec": round(time.time() - mtime, 1) if mtime else None,
+        "auth_age_sec": _auth_age_sec(),
     }
 
 
@@ -1440,7 +1619,27 @@ def main() -> None:
     parser.add_argument("--host", default="")
     parser.add_argument("--port", type=int, default=0)
     parser.add_argument("--cookies", default="")
+    parser.add_argument(
+        "--gen-admin-token",
+        action="store_true",
+        help="sinh admin.token + api_key nếu thiếu, in ra, rồi thoát (không chạy server)",
+    )
     args = parser.parse_args()
+
+    if args.gen_admin_token:
+        # Token admin phải mạnh và khác API key, nên sinh một lần rồi in ra
+        # terminal: in ra console (chỉ ai ngồi trước máy mới thấy) an toàn hơn là
+        # in ra log file hay tự mở trình duyệt tự nhiên ra.
+        raw, changed = config_store.ensure_secrets(CONFIG_FILE)
+        if not changed:
+            print("Cả api_key và admin.token đã có sẵn - không đổi gì.")
+        else:
+            print("Đã cập nhật config.json:")
+            if raw.get("api_key"):
+                print(f"  api_key      = {raw['api_key']}")
+            print(f"  admin.token  = {(raw.get('admin') or {}).get('token')}")
+        print("Mở panel: python tray.py, rồi bấm icon trên system tray.")
+        return
 
     host = args.host or os.getenv("HOST") or CONFIG.get("host") or "127.0.0.1"
     port = args.port or int(os.getenv("PORT") or CONFIG.get("port") or 8000)
@@ -1452,10 +1651,40 @@ def main() -> None:
     if not EXT_BOOTSTRAP:
         logging.warning("Extension bootstrap disabled (config extension.bootstrap=false).")
 
+    # Đăng ký file log sau khi set_log_level(): hàm đó của thư viện xoá hết
+    # handler loguru, nên đăng ký trước sẽ bị mất.
+    if not LOG["enabled"]:
+        log_path = None
+        logging.info("Ghi file log đang tắt (logging.enabled=false).")
+    else:
+        log_path = logstore.install(
+            LOG["file"], level=LOG["level"],
+            max_bytes=LOG["max_bytes"], backups=LOG["backups"],
+        )
+        if log_path:
+            logging.info("Log file: %s", log_path)
+
     logging.info("Endpoints: http://%s:%s/v1/chat/completions", host, port)
     logging.info("Models:    http://%s:%s/v1/models", host, port)
     logging.info("Chat UI:   http://%s:%s/", host, port)
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    if admin_api.HOOK.supervised:
+        logging.info("Admin:     http://%s:%s/admin (token trong config.json)", host, port)
+
+    # Tự chạy uvicorn.Server thay vì uvicorn.run() để giữ được tham chiếu tới
+    # server: /admin/api/server/restart chỉ cần set `should_exit = True` là
+    # uvicorn tự thoát gọn (nối hết request đang chạy), rồi main() trả mã 75 cho
+    # tray.py biết đó là chủ đích chứ không phải crash.
+    uvicorn_cfg = uvicorn.Config(app, host=host, port=port, log_level="info")
+    server = uvicorn.Server(uvicorn_cfg)
+    admin_api.HOOK.uvicorn = server
+    _start_parent_watchdog()
+    server.run()
+    if admin_api.HOOK.restart:
+        logging.info("Restart được yêu cầu từ panel - thoát với mã %d.", RESTART_EXIT)
+        raise SystemExit(RESTART_EXIT)
+    if admin_api.HOOK.stop:
+        logging.info("Dừng được yêu cầu từ panel - thoát với mã %d.", STOP_EXIT)
+        raise SystemExit(STOP_EXIT)
 
 
 if __name__ == "__main__":

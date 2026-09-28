@@ -6,8 +6,10 @@ from pathlib import Path
 
 from gemini_webapi import Gem, GeminiClient, logger, set_log_level
 from gemini_webapi.constants import AccountStatus, Model, warn_deprecated_model
-from gemini_webapi.exceptions import AuthError, ModelInvalidError, UsageLimitExceededError
+from gemini_webapi.exceptions import ModelInvalidError, UsageLimitExceededError
 from gemini_webapi.types import AvailableModel
+
+import net  # noqa: E402  (đường dẫn tests/ được thêm bởi trình chạy)
 
 logging.getLogger("asyncio").setLevel(logging.ERROR)
 set_log_level("DEBUG")
@@ -19,10 +21,7 @@ class TestGeminiClient(unittest.IsolatedAsyncioTestCase):
             os.getenv("SECURE_1PSID"), os.getenv("SECURE_1PSIDTS"), verify=False
         )
 
-        try:
-            await self.geminiclient.init(auto_refresh=False, verbose=True)
-        except AuthError as e:
-            self.skipTest(e)
+        await net.init_or_skip(self, self.geminiclient, auto_refresh=False, verbose=True)
 
         if self.geminiclient.account_status != AccountStatus.AVAILABLE:
             # Initialization no longer fails without usable cookies - it falls back to a guest

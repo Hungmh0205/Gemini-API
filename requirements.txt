@@ -23,6 +23,12 @@ uvicorn[standard]~=0.52.4
 pywin32>=306 ; sys_platform == "win32"
 WMI>=1.5.1 ; sys_platform == "win32"
 
+# ---------- Bảng điều khiển + System Tray ----------
+# tray.py  : icon trên system tray, menu Start/Stop/Restart/Open panel
+# Pillow   : pystray cần ảnh để dựng icon trên Windows
+pystray>=0.19.5
+Pillow>=10.0.0
+
 # ---------- Tuỳ chọn ----------
 # Đọc cookie thẳng từ profile Chrome (chỉ cần khi KHÔNG dùng extension).
 # Lưu ý: Chrome >= 127 dùng App-Bound Encryption nên cách này không còn tin cậy.
