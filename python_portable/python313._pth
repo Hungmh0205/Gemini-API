@@ -1,0 +1,9 @@
+python313.zip
+.
+Lib\site-packages
+
+# import site is what makes pip's install dir and pywin32's win32.pth work.
+# It also has a side effect we undo in sitecustomize.py: it adds the *user*
+# profile's site-packages to sys.path, which would make this folder quietly
+# depend on the machine that built it.
+import site

@@ -1,0 +1,75 @@
+<!doctype html>
+<html lang="en" dir="ltr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Gemini Cookie Sync</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+      width: 400px;
+      margin: 0;
+      padding: 16px;
+      background: Canvas;
+      color: CanvasText;
+    }
+    h1 { font-size: 17px; margin: 0 0 8px; }
+    p { font-size: 13px; line-height: 1.55; margin: 8px 0; }
+    label { font-size: 12px; display: block; margin-top: 10px; opacity: .8; }
+    input {
+      width: 100%;
+      box-sizing: border-box;
+      margin-top: 4px;
+      padding: 7px 9px;
+      border: 1px solid color-mix(in srgb, CanvasText 30%, transparent);
+      border-radius: 7px;
+      background: color-mix(in srgb, CanvasText 6%, Canvas);
+      color: CanvasText;
+      font-size: 13px;
+    }
+    button {
+      width: 100%;
+      padding: 10px 12px;
+      margin-top: 10px;
+      border: 0;
+      border-radius: 8px;
+      cursor: pointer;
+      font-size: 14px;
+    }
+    button:disabled { opacity: .55; cursor: wait; }
+    #sync { background: #17823b; color: white; }
+    #export { background: #1769e0; color: white; }
+    #inspect, #open { background: color-mix(in srgb, CanvasText 10%, Canvas); color: CanvasText; }
+    #status {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      border-radius: 8px;
+      padding: 10px;
+      margin-top: 12px;
+      background: color-mix(in srgb, CanvasText 7%, Canvas);
+      min-height: 44px;
+      max-height: 260px;
+      overflow-y: auto;
+    }
+    .error { color: #b34800; }
+    .ok { color: #17823b; }
+    code { direction: ltr; unicode-bidi: embed; }
+    .note { opacity: .78; }
+  </style>
+</head>
+<body>
+  <h1>Gemini Cookie Sync</h1>
+  <p>Pushes cookies, XSRF, and build metadata from the current Gemini session straight to your local server, which saves <code>gemini-auth.json</code> and re-authenticates automatically. Nothing is sent over the internet.</p>
+  <label>Server URL <input id="baseUrl" type="url" spellcheck="false" placeholder="http://127.0.0.1:8000"></label>
+  <label>API key <input id="apiKey" type="password" spellcheck="false" placeholder="sk-lumi"></label>
+  <button id="sync" type="button">Sync to server</button>
+  <button id="open" type="button">Open Gemini</button>
+  <button id="inspect" type="button">Inspect session</button>
+  <button id="export" type="button">Export gemini-auth.json</button>
+  <p id="status">Ready.</p>
+  <p class="note">Open Gemini, sign in, then refresh the page before sync. The extension also auto-syncs in the background every few minutes while Chrome is running (a hidden tab is opened if needed). The session data is sensitive; do not share it or commit it to Git.</p>
+  <script src="collect.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

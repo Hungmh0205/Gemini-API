@@ -1,0 +1,32 @@
+# =============================================================================
+# Gemini-API (Lumi-Agent) - cài đặt bằng:
+#     venv\Scripts\python.exe -m pip install -r requirements.txt
+#
+# Thư viện gốc (src/gemini_webapi) + tầng server OpenAI-compatible (server.py)
+# + launcher Chrome ẩn (chrome_launcher.py). Python >= 3.11.
+# =============================================================================
+
+# ---------- Thư viện gốc: gemini-webapi ----------
+curl-cffi~=0.16.2
+loguru~=0.7.3
+orjson~=3.11.9
+pydantic~=2.12.5
+
+# ---------- Tầng server: OpenAI-compatible gateway ----------
+# server.py -> uvicorn chạy FastAPI trên 127.0.0.1:8000
+fastapi~=0.141.1
+uvicorn[standard]~=0.52.4
+
+# ---------- Launcher Chrome ẩn (Windows) ----------
+# pywin32: EnumWindows/ShowWindow để ẩn cửa sổ Chrome
+# WMI     : liệt kê chrome.exe + commandline để tìm instance theo --user-data-dir
+pywin32>=306 ; sys_platform == "win32"
+WMI>=1.5.1 ; sys_platform == "win32"
+
+# ---------- Tuỳ chọn ----------
+# Đọc cookie thẳng từ profile Chrome (chỉ cần khi KHÔNG dùng extension).
+# Lưu ý: Chrome >= 127 dùng App-Bound Encryption nên cách này không còn tin cậy.
+browser-cookie3>=0.20.1
+
+# Nạp .env nếu bạn muốn (không bắt buộc, server.py đọc os.environ).
+python-dotenv>=1.0

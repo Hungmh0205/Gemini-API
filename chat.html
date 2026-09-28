@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gemini Chat Test</title>
+<style>
+  :root { --bg:#0f1115; --panel:#161a22; --bubble:#1f2630; --accent:#4f8cff; --text:#e6e9ef; --muted:#9aa3b2; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:"Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; }
+  header { padding:10px 16px; background:var(--panel); display:flex; gap:10px; align-items:center; border-bottom:1px solid #232a36; flex-wrap:wrap; }
+  header h1 { font-size:15px; margin:0; color:var(--accent); }
+  header input, header select { background:#0d1016; border:1px solid #2a3242; color:var(--text); padding:6px 10px; border-radius:8px; font-size:13px; }
+  #apiKey { flex:1; min-width:200px; }
+  #model { width:170px; }
+  #messages { flex:1; overflow-y:auto; padding:18px; display:flex; flex-direction:column; gap:10px; }
+  .msg { max-width:72%; padding:10px 14px; border-radius:14px; font-size:14px; line-height:1.5; white-space:pre-wrap; word-break:break-word; }
+  .msg.user { align-self:flex-end; background:var(--accent); color:#fff; }
+  .msg.ai { align-self:flex-start; background:var(--bubble); }
+  .msg b.role { font-size:11px; color:var(--muted); display:block; margin-bottom:4px; }
+  .msg img { display:block; max-width:220px; margin:6px 0; border-radius:8px; }
+  .msg.error { align-self:center; background:#3a1f24; color:#ffb3b3; }
+  #composer { background:var(--panel); border-top:1px solid #232a36; padding:12px 16px; display:flex; gap:10px; align-items:flex-end; flex-wrap:wrap; }
+  #input { flex:1; min-height:44px; resize:vertical; background:#0d1016; border:1px solid #2a3242; color:var(--text); border-radius:10px; padding:10px 12px; font-size:14px; font-family:inherit; }
+  #attachments { display:flex; gap:8px; flex-wrap:wrap; width:100%; }
+  .thumb { position:relative; }
+  .thumb img { width:56px; height:56px; object-fit:cover; border-radius:8px; border:1px solid #2a3242; }
+  .thumb button { position:absolute; top:-6px; right:-6px; width:18px; height:18px; border:none; border-radius:50%; background:#e5484d; color:#fff; cursor:pointer; font-size:11px; line-height:18px; }
+  button { cursor:pointer; }
+  #send, #attach { background:var(--accent); border:none; color:#fff; padding:10px 16px; border-radius:10px; font-size:14px; }
+  #attach { background:#2a3242; }
+  #send:disabled { opacity:.5; cursor:default; }
+  .hint { font-size:11px; color:var(--muted); align-self:center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Gemini Chat Test</h1>
+  <input id="apiKey" placeholder="API Key (lưu tự động)">
+  <input id="model" placeholder="model (để trống = mặc định)" value="gemini-flash">
+  <button id="clear" style="background:#2a3242;border:none;color:#fff;padding:6px 12px;border-radius:8px">Reset</button>
+</header>
+
+<div id="messages"><div class="hint">Gõ tin nhắn bên dưới để test API. Bấm nút &#128206; để đính kèm ảnh.</div></div>
+
+<div id="composer">
+  <div id="attachments"></div>
+  <textarea id="input" placeholder="Nhập tin nhắn..."></textarea>
+  <button id="attach" title="Đính kèm ảnh">&#128206;</button>
+  <button id="send">Gửi</button>
+</div>
+
+<input type="file" id="file" accept="image/*" multiple hidden>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const msgs = [];
+let attachments = [];
+
+const apiKey = localStorage.getItem("gemini_api_key") || "";
+$("apiKey").value = apiKey;
+$("apiKey").addEventListener("input", () => {
+  localStorage.setItem("gemini_api_key", $("apiKey").value.trim());
+});
+
+function addMsg(role, text, imgDataUrls) {
+  const div = document.createElement("div");
+  div.className = "msg " + (role === "user" ? "user" : role === "error" ? "error" : "ai");
+  const r = document.createElement("b");
+  r.className = "role";
+  r.textContent = role === "user" ? "Bạn" : role === "error" ? "Lỗi" : "Gemini";
+  div.appendChild(r);
+  (imgDataUrls || []).forEach((url) => {
+    const im = document.createElement("img");
+    im.src = url;
+    div.appendChild(im);
+  });
+  const p = document.createElement("div");
+  p.textContent = text || "";
+  div.appendChild(p);
+  $("messages").appendChild(div);
+  $("messages").scrollTop = $("messages").scrollHeight;
+  return p;
+}
+
+function buildHistory() {
+  return msgs.map((m) => ({
+    role: m.role,
+    content: [
+      { type: "text", text: m.text },
+      ...(m.images || []).map((url) => ({ type: "image_url", image_url: { url } })),
+    ],
+  }));
+}
+
+function renderThumbs() {
+  $("attachments").innerHTML = "";
+  attachments.forEach(([url, name], i) => {
+    const w = document.createElement("div");
+    w.className = "thumb";
+    const im = document.createElement("img");
+    im.src = url;
+    const x = document.createElement("button");
+    x.textContent = "×";
+    x.onclick = () => { attachments.splice(i, 1); renderThumbs(); };
+    w.append(im, x);
+    $("attachments").appendChild(w);
+  });
+}
+
+$("file").addEventListener("change", () => {
+  for (const f of $("file").files) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      attachments.push([reader.result, f.name]);
+      renderThumbs();
+    };
+    reader.readAsDataURL(f);
+  }
+  $("file").value = "";
+});
+
+$("attach").onclick = () => $("file").click();
+$("clear").onclick = () => {
+  msgs.length = 0;
+  attachments = [];
+  renderThumbs();
+  $("messages").innerHTML = "";
+  const h = document.createElement("div");
+  h.className = "hint";
+  h.textContent = "Đã reset hội thoại.";
+  $("messages").appendChild(h);
+};
+
+async function send() {
+  const text = $("input").value.trim();
+  if (!text) return;
+  const key = $("apiKey").value.trim();
+  if (!key) { addMsg("error", "Nhập API Key trước."); return; }
+
+  const myAttach = attachments.slice();
+  attachments = [];
+  renderThumbs();
+  $("input").value = "";
+
+  const imgs = myAttach.map(([url]) => url);
+  addMsg("user", text, imgs);
+  msgs.push({ role: "user", text, images: imgs });
+
+  const aiP = addMsg("ai", "");
+  msgs.push({ role: "assistant", text: "" });
+  const aiIdx = msgs.length - 1;
+
+  const btn = $("send");
+  btn.disabled = true;
+
+  const body = {
+    model: $("model").value.trim() || null,
+    stream: true,
+    messages: buildHistory(),
+  };
+
+  try {
+    const resp = await fetch("/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + key,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!resp.ok) {
+      let detail = "HTTP " + resp.status;
+      try { const j = await resp.json(); detail = j.detail || j.error?.message || detail; } catch (e) {}
+      aiP.textContent = detail;
+      msgs[aiIdx].text = detail;
+      return;
+    }
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    let done = false;
+    while (!done) {
+      const { value, done: d } = await reader.read();
+      done = d;
+      buf += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const parts = buf.split("\n\n");
+      buf = parts.pop();
+      for (const p of parts) {
+        for (const line of p.split("\n")) {
+          if (!line.startsWith("data:")) continue;
+          const data = line.slice(5).trim();
+          if (data === "[DONE]") continue;
+          try {
+            const j = JSON.parse(data);
+            if (j.choices?.[0]?.delta?.content) {
+              aiP.textContent += j.choices[0].delta.content;
+              msgs[aiIdx].text += j.choices[0].delta.content;
+              $("messages").scrollTop = $("messages").scrollHeight;
+            }
+            if (j.error) { aiP.textContent = "Lỗi: " + j.error.message; }
+          } catch (e) {}
+        }
+      }
+    }
+  } catch (e) {
+    aiP.textContent = "Lỗi kết nối: " + e.message;
+    msgs[aiIdx].text = "Lỗi kết nối: " + e.message;
+  } finally {
+    btn.disabled = false;
+    $("input").focus();
+  }
+}
+
+$("send").onclick = send;
+$("input").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+});
+</script>
+</body>
+</html>
