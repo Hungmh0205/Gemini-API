@@ -324,13 +324,11 @@ def port_busy(host: str, port: int) -> bool:
         return s.connect_ex((host if host not in ("0.0.0.0", "::") else "127.0.0.1", port)) == 0
 
 
-def make_icon_image(size: int = 64):
-    """Vẽ icon tray bằng Pillow.
+LOGO_PNG = BASE_DIR / "logo.png"
 
-    Vẽ bằng code thay vì dùng favicon.png: file PNG có alpha, còn pystray trên
-    Windows yêu cầu icon 32bit ARGB có alpha thật, và thêm phụ thuộc đọc file
-    cho một hình tròn là không đáng.
-    """
+
+def _draw_fallback_icon(size: int):
+    """Icon dự phòng khi thiếu/hỏng logo.png: hình tròn "đèn báo" vẽ bằng code."""
     from PIL import Image, ImageDraw
 
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -341,6 +339,36 @@ def make_icon_image(size: int = 64):
     r = size * 0.22
     d.ellipse((size / 2 - r, size / 2 - r, size / 2 + r, size / 2 + r), fill=(76, 141, 255, 255))
     return img
+
+
+def make_icon_image(size: int = 64):
+    """Icon tray: logo.png nếu đọc được, không thì vẽ dự phòng.
+
+    pystray trên Windows cần icon 32bit ARGB có alpha thật, nên logo.png được
+    ép về RGBA rồi thu nhỏ bằng LANCZOS để viền mượt ở 16/32px.
+
+    Logo gốc có khoảng 10% viền trong suốt mỗi bên; ở 16px mà để nguyên thì
+    nội dung chỉ còn ~33% khung và trông rất nhỏ, nên cắt theo vùng có alpha rồi
+    thêm lại một chút đệm cân bằng.
+    """
+    from PIL import Image
+
+    if LOGO_PNG.is_file():
+        try:
+            with Image.open(LOGO_PNG) as src:
+                logo = src.convert("RGBA")
+            box = logo.getchannel("A").getbbox()
+            if box:
+                # Cắt thành hình vuông quanh tâm vùng nội dung: khung vuông giữ
+                # đúng tỉ lệ khi ép về size, thay vì bị kéo giãn nhẹ.
+                cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+                half = max(box[2] - box[0], box[3] - box[1]) / 2 * 1.04
+                logo = logo.crop((int(cx - half), int(cy - half),
+                                  int(cx + half), int(cy + half)))
+            return logo.resize((size, size), Image.LANCZOS)
+        except Exception:  # logo hỏng thì vẫn phải có tray icon
+            pass
+    return _draw_fallback_icon(size)
 
 
 # ----------------------------------------------------------------------------

@@ -4,7 +4,10 @@ import shutil
 import sys
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
+
+from PIL import Image
 
 if (_root := str(Path(__file__).resolve().parent.parent)) not in sys.path:
     sys.path.insert(0, _root)
@@ -614,6 +617,97 @@ class TestUvicornLogging(unittest.TestCase):
         n = sum(1 for h in logging.getLogger("uvicorn.access").handlers
                 if getattr(h, "_lumi_file_handler", False))
         self.assertEqual(n, 1, "gọi hai lần phải không dồn handler")
+
+
+class TestFaviconAndLogo(unittest.TestCase):
+    """`/favicon.ico` và `/logo.png` phục vụ đúng logo.png của người dùng.
+
+    Hai route này phục vụ web UI: favicon cho tab trình duyệt, `/logo.png` cho
+    logo trong header. Chúng phải đọc từ đĩa (không nhúng base64) và phải trả 404
+    gọn gàng khi file vắng, thay vì làm hỏng request.
+    """
+
+    def test_ico_is_built_from_logo_and_cached(self):
+        import asyncio
+
+        import server
+
+        data = asyncio.run(server.favicon())
+        self.assertEqual(data.media_type, "image/x-icon")
+        self.assertEqual(data.body, server._favicon_ico(), "phải nhớ kết quả")
+        self.assertIs(data.body, server._favicon_ico(), "gọi lần hai phải dùng cache")
+
+        with Image.open(BytesIO(data.body)) as im:
+            self.assertEqual(im.format, "ICO")
+            self.assertLessEqual(im.size, (1024, 1024))
+
+    def test_logo_route_serves_real_png_bytes(self):
+        """`/logo.png` phải trả PNG thật, không phục vụ nguyên bytes trên đĩa.
+
+        Người dùng có thể đổi tên một file .ico thành .png; lúc đó bytes trên đĩa
+        là ICO nhưng Content-Type là image/png và `<img>` trên web không chắc
+        hiện được. Route phải chuẩn hoá lúc phục vụ.
+        """
+        import asyncio
+
+        import server
+
+        data = asyncio.run(server.logo_png())
+        self.assertEqual(data.media_type, "image/png")
+        self.assertIs(data.body, server._logo_png_bytes(), "phải nhớ kết quả")
+        with Image.open(BytesIO(data.body)) as im:
+            self.assertEqual(im.format, "PNG")
+            self.assertEqual(im.size[0], im.size[1], "logo phải cắt thành khung vuông")
+
+    def test_logo_renamed_ico_still_serves_valid_png_and_ico(self):
+        """File tên .png nhưng nội dung là ICO: cả hai route vẫn đúng format."""
+        import asyncio
+
+        import server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            real_png = server.LOGO_PNG
+            icon_src = Path(tmp) / "icon.png"  # đuôi .png, nội dung ICO
+            Image.new("RGBA", (256, 256), (0, 0, 0, 0)).save(icon_src, format="ICO",
+                                                              sizes=[(16, 16), (256, 256)])
+            server.LOGO_PNG = icon_src
+            server._logo_png_cache = None
+            server._favicon_cache = None
+            try:
+                png = asyncio.run(server.logo_png())
+                with Image.open(BytesIO(png.body)) as im:
+                    self.assertEqual(im.format, "PNG")
+                ico = asyncio.run(server.favicon())
+                self.assertEqual(ico.media_type, "image/x-icon")
+                with Image.open(BytesIO(ico.body)) as im:
+                    self.assertEqual(im.format, "ICO")
+                    self.assertIn((16, 16), im.info.get("sizes", []))
+            finally:
+                server.LOGO_PNG = real_png
+                server._logo_png_cache = None
+                server._favicon_cache = None
+
+    def test_missing_logo_returns_404_instead_of_crashing(self):
+        import asyncio
+
+        import server
+
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "khong-co.png"
+            real = server.LOGO_PNG
+            server.LOGO_PNG = missing
+            try:
+                self.assertEqual(asyncio.run(server.favicon()).status_code, 404)
+                self.assertEqual(asyncio.run(server.logo_png()).status_code, 404)
+            finally:
+                server.LOGO_PNG = real
+
+    def test_both_pages_link_the_favicon(self):
+        for name in ("admin.html", "chat.html"):
+            with self.subTest(page=name):
+                html = (Path(__file__).resolve().parent.parent / name).read_text("utf-8")
+                self.assertIn('href="/favicon.ico"', html)
+                self.assertIn('src="/logo.png"', html)
 
 
 if __name__ == "__main__":

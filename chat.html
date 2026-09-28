@@ -4,12 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Gemini Chat Test</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
 <style>
   :root { --bg:#0f1115; --panel:#161a22; --bubble:#1f2630; --accent:#4f8cff; --text:#e6e9ef; --muted:#9aa3b2; }
   * { box-sizing: border-box; }
   body { margin:0; font-family:"Segoe UI",system-ui,sans-serif; background:var(--bg); color:var(--text); height:100vh; display:flex; flex-direction:column; }
   header { padding:10px 16px; background:var(--panel); display:flex; gap:10px; align-items:center; border-bottom:1px solid #232a36; flex-wrap:wrap; }
   header h1 { font-size:15px; margin:0; color:var(--accent); }
+  header .logo { width:24px; height:24px; flex:none; }
   header input, header select { background:#0d1016; border:1px solid #2a3242; color:var(--text); padding:6px 10px; border-radius:8px; font-size:13px; }
   #apiKey { flex:1; min-width:200px; }
   #model { width:170px; }
@@ -35,6 +37,7 @@
 </head>
 <body>
 <header>
+  <img class="logo" src="/logo.png" alt="Lumi">
   <h1>Gemini Chat Test</h1>
   <input id="apiKey" placeholder="API Key (lưu tự động)">
   <input id="model" placeholder="model (để trống = mặc định)" value="gemini-flash">

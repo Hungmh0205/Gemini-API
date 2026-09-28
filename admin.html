@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="robots" content="noindex, nofollow">
 <title>Lumi Agent - Bảng điều khiển</title>
+<link rel="icon" href="/favicon.ico" sizes="any">
 <style>
   :root {
     --bg: #0e1116; --panel: #161b22; --panel2: #1c232c; --line: #2a3038;
@@ -16,7 +17,8 @@
          font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
   header { display: flex; align-items: center; gap: 12px; padding: 12px 20px;
            border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 5; }
-  h1 { font-size: 16px; margin: 0; font-weight: 600; }
+    h1 { font-size: 16px; margin: 0; font-weight: 600; }
+    .logo { width: 26px; height: 26px; flex: none; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
   .dot.ok { background: var(--ok); box-shadow: 0 0 8px var(--ok); }
   .dot.bad { background: var(--err); box-shadow: 0 0 8px var(--err); }
@@ -93,6 +95,7 @@
 
 <div id="app" style="display:none">
   <header>
+    <img class="logo" src="/logo.png" alt="Lumi Agent">
     <div class="dot" id="hDot"></div>
     <h1>Lumi Agent</h1>
     <span class="hint" id="hModel"></span>

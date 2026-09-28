@@ -288,6 +288,102 @@ class TestLoggingSurvivesEveryConsole(unittest.TestCase):
             tray._log("vẫn phải sống")
 
 
+class TestTrayIconFromLogo(unittest.TestCase):
+    """Icon tray lấy từ logo.png, và không bao giờ làm tray chết vì ảnh.
+
+    pystray trên Windows cần ảnh 32bit ARGB có alpha thật; logo.png là PNG
+    palette nên phải ép về RGBA. Ba test dưới ghim: kích thước/mode, fallback
+    khi ảnh hỏng, và quan trọng nhất là test không được ghi đè lên logo.png thật.
+    """
+
+    def setUp(self):
+        self._logo = tray.LOGO_PNG
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(setattr, tray, "LOGO_PNG", self._logo)
+
+    def test_icon_is_rgba_at_every_size_windows_uses(self):
+        for size in (16, 32, 64, 256):
+            with self.subTest(size=size):
+                img = tray.make_icon_image(size)
+                self.assertEqual(img.mode, "RGBA")
+                self.assertEqual(img.size, (size, size))
+                lo, hi = img.getchannel("A").getextrema()
+                self.assertEqual((lo, hi), (0, 255))  # có alpha, không phải ảnh đục
+
+    def test_real_logo_is_not_writable_by_test(self):
+        """Chốt hành vi: đổi LOGO_PNG rồi xử lý ảnh hỏng cũng không đụng file thật.
+
+        Đã xảy ra thật: một lần kiểm thử ghi "file hỏng" thẳng lên logo.png của
+        người dùng và xoá mất ảnh gốc. Giờ mọi thao tác phải đi qua bản sao tạm.
+        """
+        copy = Path(self.tmp.name) / "logo.png"
+        copy.write_bytes(self._logo.read_bytes())
+        before = self._logo.read_bytes()
+
+        tray.LOGO_PNG = copy
+        copy.write_bytes(b"khong phai png")  # ảnh hỏng
+        img = tray.make_icon_image(64)
+
+        self.assertEqual((img.mode, img.size), ("RGBA", (64, 64)))
+        self.assertEqual(self._logo.read_bytes(), before)
+
+    def test_falls_back_when_logo_missing_or_broken(self):
+        tray.LOGO_PNG = Path(self.tmp.name) / "khong-co.png"
+        self.assertEqual(tray.make_icon_image(64).mode, "RGBA")
+
+        broken = Path(self.tmp.name) / "logo.png"
+        broken.write_bytes(b"\x89PNG\r\n\x1a\n hong")
+        tray.LOGO_PNG = broken
+        img = tray.make_icon_image(64)
+        self.assertEqual((img.mode, img.size), ("RGBA", (64, 64)))
+        self.assertGreater(img.getchannel("A").getextrema()[1], 0)  # có hình vẽ
+
+    def _use_logo(self, img, name="logo.png"):
+        path = Path(self.tmp.name) / name
+        img.save(path)
+        tray.LOGO_PNG = path
+
+    def test_transparent_margin_is_trimmed_so_small_icons_stay_readable(self):
+        """Logo gốc có ~10% viền trong suốt; ở 16px thì phải cắt bớt.
+
+        Không cắt thì nội dung chỉ chiếm ~33% khung ở 16px và icon tray trông
+        nhỏ như một vết. Sau khi cắt phải đầy khung hơn đáng kể.
+        """
+        from PIL import Image, ImageDraw
+
+        src = Image.new("RGBA", (1024, 1024), (0, 0, 0, 0))
+        ImageDraw.Draw(src).ellipse((300, 300, 724, 724), fill=(76, 141, 255, 255))
+        self._use_logo(src)
+
+        small = tray.make_icon_image(16)
+        frac = sum(1 for px in small.get_flattened_data() if px[3] > 8) / (16 * 16)
+        self.assertGreater(frac, 0.55, f"chi {frac:.0%} khung co noi dung")
+
+    def test_icon_keeps_aspect_ratio(self):
+        """Cắt vuông quanh tâm: nội dung phải giữ tỉ lệ, không bị kéo méo.
+
+        Logo thật có vùng nội dung 824x843 (không vuông). Nếu ép thẳng về 16x16
+        thì chiều ngang bị nén ~2% - ở 16px đó là vài pixel lệch. Vẽ một bầu
+        dục rộng 300 cao 220 rồi đo 4 khoảng đệm: cắt vuông + canh giữa thì
+        trái≈phải, trên≈dưới, và đệm ngang hẹp hơn đệm dọc.
+        """
+        from PIL import Image, ImageDraw
+
+        src = Image.new("RGBA", (400, 400), (0, 0, 0, 0))
+        ImageDraw.Draw(src).ellipse((50, 90, 350, 310), fill=(255, 255, 255, 255))
+        self._use_logo(src)
+
+        size = 64
+        box = tray.make_icon_image(size).getchannel("A").getbbox()
+        self.assertIsNotNone(box)
+        left, top, right, bottom = box
+        ml, mr, mt, mb = left, size - right, top, size - bottom
+        self.assertAlmostEqual(ml, mr, delta=2, msg="lệch trái-phải: cắt không vuông/cân giữa")
+        self.assertAlmostEqual(mt, mb, delta=2, msg="lệch trên-dưới: cắt không vuông/cân giữa")
+        self.assertLess(ml, mt, "bầu dục rộng hơn cao nên đệm ngang phải hẹp hơn")
+
+
 class TestTrayMenu(unittest.TestCase):
     def test_menu_cannot_stop_and_quit_at_once(self):
         # "Dừng server" giữ icon, còn "Thoát" mới tắt icon. Nếu chúng gọi chung

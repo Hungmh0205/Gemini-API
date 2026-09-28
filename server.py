@@ -45,7 +45,7 @@ import uvicorn
 from curl_cffi import CurlFollow, CurlHttpVersion
 from curl_cffi.requests import AsyncSession
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict
 
 if (_src := str(Path(__file__).resolve().parent / "src")) not in sys.path:
@@ -992,11 +992,80 @@ def build_prompt(messages: list[dict]) -> str:
 
 
 CHAT_HTML = Path(__file__).with_name("chat.html")
+LOGO_PNG = Path(__file__).with_name("logo.png")
+_logo_png_cache: bytes | None = None
+_favicon_cache: bytes | None = None
+
+
+def _logo_image():
+    """Mở logo, ép về RGBA và cắt thành khung vuông quanh tâm nội dung.
+
+    Không giả định file là PNG: người dùng có thể đổi tên một file .ico thành
+    .png, và lúc đó `Image.open` vẫn nhận đúng format theo magic bytes. Cắt
+    vuông vì logo gốc có ~10% viền trong suốt mỗi bên, giữ lại thì ở 16px icon
+    chỉ còn ~33% khung.
+    """
+    from PIL import Image
+
+    with Image.open(LOGO_PNG) as src:
+        logo = src.convert("RGBA")
+    box = logo.getchannel("A").getbbox()
+    if box:
+        cx, cy = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+        half = max(box[2] - box[0], box[3] - box[1]) / 2 * 1.04
+        logo = logo.crop((int(cx - half), int(cy - half),
+                          int(cx + half), int(cy + half)))
+    return logo
+
+
+def _logo_png_bytes() -> bytes:
+    """Logo dạng PNG thật, nhớ kết quả.
+
+    Web phải nhận đúng PNG: nếu file trên đĩa là ICO (hay bất cứ format nào)
+    mà cứ phục vụ nguyên bytes với Content-Type image/png thì `<img>` không
+    chắc hiện được, tab trình duyệt có thể trắng.
+    """
+    global _logo_png_cache
+    if _logo_png_cache is None:
+        from io import BytesIO
+
+        buf = BytesIO()
+        _logo_image().save(buf, format="PNG")
+        _logo_png_cache = buf.getvalue()
+    return _logo_png_cache
+
+
+def _favicon_ico() -> bytes:
+    """Favicon cho tab trình duyệt, dựng từ logo (nhớ kết quả để khỏi dựng lại)."""
+    global _favicon_cache
+    if _favicon_cache is None:
+        from io import BytesIO
+
+        ico = BytesIO()
+        _logo_image().save(ico, format="ICO", sizes=[(16, 16), (32, 32), (48, 48)])
+        _favicon_cache = ico.getvalue()
+    return _favicon_cache
 
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return CHAT_HTML.read_text(encoding="utf-8")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    if not LOGO_PNG.is_file():
+        return Response(status_code=404)
+    return Response(_favicon_ico(), media_type="image/x-icon",
+                    headers={"Cache-Control": "public, max-age=86400"})
+
+
+@app.get("/logo.png", include_in_schema=False)
+async def logo_png():
+    if not LOGO_PNG.is_file():
+        return Response(status_code=404)
+    return Response(_logo_png_bytes(), media_type="image/png",
+                    headers={"Cache-Control": "public, max-age=86400"})
 
 
 @app.get("/health")
