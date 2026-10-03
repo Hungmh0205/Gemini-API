@@ -18,21 +18,23 @@ fastapi~=0.141.1
 uvicorn[standard]~=0.52.4
 
 # ---------- Launcher Chrome ẩn (Windows) ----------
-# pywin32: EnumWindows/ShowWindow để ẩn cửa sổ Chrome
-# WMI     : liệt kê chrome.exe + commandline để tìm instance theo --user-data-dir
-pywin32>=306 ; sys_platform == "win32"
-WMI>=1.5.1 ; sys_platform == "win32"
+# KHÔNG cần pywin32/WMI: chrome_launcher.py gọi thẳng Win32 API qua `ctypes`
+# (EnumWindows/ShowWindow để ẩn cửa sổ) và liệt kê tiến trình bằng PowerShell
+# `Get-CimInstance Win32_Process`. Thêm 2 gói này chỉ làm nặng venv.
+#
+# Lưu ý cho người đọc sửa code: đừng thêm lại import pywin32/WMI. EnumWindows phải
+# chạy trên đúng thread đã tạo window (`EnumWindows` của user32), và WMI qua
+# PowerShell chậm ~0.5s/call nên chỉ dùng ở đường chạy nền, không dùng trong
+# vòng poll.
 
 # ---------- Bảng điều khiển + System Tray ----------
 # tray.py  : icon trên system tray, menu Start/Stop/Restart/Open panel
 # Pillow   : pystray cần ảnh để dựng icon trên Windows
 pystray>=0.19.5
-Pillow>=10.0.0
+# Chặn trần để không đổi hành vi khi Pillow đổi API ở bản mới (>=11 đã bỏ
+# Image.ANTIALIAS và đổi nhiều hằng). Đây là bản đang chạy và đã test.
+Pillow>=10.0.0,<13
 
-# ---------- Tuỳ chọn ----------
-# Đọc cookie thẳng từ profile Chrome (chỉ cần khi KHÔNG dùng extension).
-# Lưu ý: Chrome >= 127 dùng App-Bound Encryption nên cách này không còn tin cậy.
-browser-cookie3>=0.20.1
-
-# Nạp .env nếu bạn muốn (không bắt buộc, server.py đọc os.environ).
-python-dotenv>=1.0
+# KHÔNG cần browser-cookie3 (Chrome >= 127 dùng App-Bound Encryption nên đọc
+# cookie trực tiếp không còn tin cậy) và python-dotenv (server.py đọc thẳng
+# os.environ). Cài chúng chỉ thêm bề mặt tấn công và thời gian cài.

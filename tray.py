@@ -43,6 +43,15 @@ RESTART_EXIT = 75  # EX_TEMPFAIL: cố ý restart, KHÔNG phải crash
 STOP_EXIT = 76  # EX_PROTOCOL: cố ý dừng, KHÔNG phải crash (xem server.py)
 MAX_FAST_RESTARTS = 5
 FAST_RESTART_WINDOW = 60.0
+# Thời gian tối thiểu để coi một lần chạy là "đã từng khoẻ". Cần có vì mấy giây
+# đầu server còn treo `client_init()`, và một crash ngay sau đó không phải là
+# server ổn rồi hỏng.
+HEALTHY_AFTER = 120.0
+# Trần SỐ LẦN bật lại liên tiếp, tính cả những lần chậm. `MAX_FAST_RESTARTS`
+# chỉ bắt được vòng lặp nhanh: nếu mỗi lần treo mất vài phút rồi mới chết, cửa
+# sổ 60s không bao giờ đầy và tray sẽ spawn vô hạn.
+MAX_TOTAL_RESTARTS = 20
+RESTART_BACKOFF = (1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 60.0)
 
 try:
     import pystray
@@ -113,7 +122,61 @@ def read_settings() -> dict:
         "base_url": f"http://{host}:{port}",
         "token": (raw.get("admin") or {}).get("token") or "",
         "path": path,
+        "startup_state": BASE_DIR / "server-startup.json",
     }
+
+
+def _pid_alive(pid: int) -> bool:
+    """Tiến trình còn sống không — để tin file `server-startup.json`."""
+    if sys.platform != "win32":
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+    import ctypes
+
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = ctypes.c_void_p
+    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not h:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not k32.GetExitCodeProcess(ctypes.c_void_p(h), ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(ctypes.c_void_p(h))
+
+
+def startup_server_age(path: Path) -> tuple[float, str] | None:
+    """Server khác đang khởi động dở không, và đã khởi động bao lâu.
+
+    Cần để phân biệt "cổng bị chương trình khác chiếm" (báo lỗi, thoát) với "Lumi
+    của một lần chạy trước còn đang khởi động" (phải đợi). Trước đây cả hai đều ra
+    cùng một thông báo, và người dùng phải tự đoán.
+
+    Chỉ cần file tự ghi là đủ: không spawn PowerShell, nên đọc ở đây rẻ.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    pid, started = data.get("pid"), data.get("started_at")
+    if not isinstance(pid, int) or not isinstance(started, (int, float)):
+        return None
+    age = time.time() - float(started)
+    if age < 0 or age > 240.0:
+        # 240.0 cố ý trùng `server.STARTUP_STATE_MAX_AGE`. Không import hằng đó
+        # từ server được: import server.py sẽ chạy side effect ở tầng module
+        # (đọc config, dựng app). Sửa một bên thì phải sửa cả bên kia.
+        return None  # rác của một lần chạy đã chết
+    if not _pid_alive(pid):
+        return None
+    return age, str(pid)
 
 
 # ----------------------------------------------------------------------------
@@ -131,6 +194,18 @@ class ServerProcess:
         self.quitting = False
         self.idle = False
         self.external = False
+        # Mốc bắt đầu của lần chạy hiện tại (monotonic). Dùng để biết server
+        # đang khởi động hay đã lên, và để nhận ra một lần chạy đã sống đủ lâu.
+        self.started_at = 0.0
+        # Số lần bật lại liên tiếp kể từ lần chạy ổn định gần nhất. Lỗi cấu
+        # hình thường lặp lại mỗi vài phút, nên phải có trần riêng cho cả các
+        # lần chậm, không chỉ dựa vào `restarts` trong 60s.
+        self.consecutive = 0
+        # Lần chạy này đã từng phản hồi `/health` chưa. Đây mới là tiêu chí
+        # "đã ổn" — KHÔNG dùng thời gian sống, vì một server cấu hình sai vẫn
+        # sống được 3 phút rồi mới chết, và reset theo thời gian sẽ khiến vòng
+        # lặp chậm đó chạy mãi.
+        self.became_healthy = False
         self.wake = threading.Event()
         self.lock = threading.RLock()
         # Tray chết mà server con sống dai = một server mồ côi giữ cổng, không ai
@@ -170,6 +245,8 @@ class ServerProcess:
             env.setdefault("LUMI_CONFIG", str(self.settings["path"]))
             env.setdefault("PYTHONIOENCODING", "utf-8")
             _log(f"khởi động server -> {self.settings['base_url']}")
+            self.started_at = time.monotonic()
+            self.became_healthy = False
             self.proc = subprocess.Popen(
                 [sys.executable, "-X", "utf8", str(SERVER_PY)],
                 cwd=str(BASE_DIR),
@@ -209,13 +286,52 @@ class ServerProcess:
             return 0
         if proc is None:
             return 0
-        return proc.wait()
+        # Poll thay vì `proc.wait()`: cần biết server có bao giờ thực sự phản hồi
+        # `/health` trong lần chạy này không. Đây là dữ liệu `should_restart`
+        # dùng để phân biệt "đã từng phục vụ rồi hỏng" (bật lại bình thường) với
+        # "chưa bao giờ lên" (lỗi cấu hình, phải chặn).
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                return rc
+            if health(self.settings) is not None:
+                self.became_healthy = True
+            time.sleep(2.0)
 
     def alive(self) -> bool:
+        """Có tiến trình server nào đang giữ cổng không (kể cả đang khởi động)."""
+        return self.status() != "stopped"
+
+    def status(self) -> str:
+        """`starting` | `ok` | `stopped`.
+
+        Phân biệt "đang khởi động" với "đã chết" là bắt buộc: `client_init()` có
+        thể mất tới `init_timeout` giây và `/health` chỉ mở sau đó. Nếu gộp hai
+        vế, menu sẽ mời bấm "Khởi động server" đúng lúc server đang bật — bấm là
+        spawn thêm một cái, cái mới lập tức crash vì cổng đã bị chiếm.
+        """
         with self.lock:
-            if self.external:
-                return health(self.settings) is not None
-            return bool(self.proc and self.proc.poll() is None)
+            external = self.external
+            proc = self.proc
+            started_at = self.started_at
+        running = health(self.settings) is not None
+        if external:
+            return "ok" if running else "stopped"
+        if proc is not None and proc.poll() is None:
+            return "ok" if running else "starting"
+        return "stopped"
+
+    def status_text(self) -> str:
+        """Một dòng trạng thái để hiện ra menu/log, không bịa."""
+        st = self.status()
+        if st == "starting":
+            elapsed = time.monotonic() - self.started_at if self.started_at else 0.0
+            return f"đang khởi động ({elapsed:.0f}s, chưa mở cổng)"
+        if st == "ok":
+            return "đang chạy"
+        if self.last_error:
+            return f"đã dừng: {self.last_error}"
+        return "đã dừng"
 
     def poll(self) -> int | None:
         with self.lock:
@@ -228,10 +344,20 @@ class ServerProcess:
         crash/kill. Cả hai đều bật lại, nhưng phải chặn trường hợp server crash
         liên tục (sai cấu hình, port bị chiếm) - nếu không nó sẽ spawn process
         không ngừng và làm nặng máy.
+
+        Hai lớp chặn vì crash nhanh và crash chậm cần hai cách khác nhau:
+          - nhanh (vòng lặp dưới 1 phút): cửa sổ 60s bắt được.
+          - chậm (mỗi lần treo vài phút): cửa sổ không bao giờ đầy, phải đếm tổng.
         """
         if self.stopping:
             return False
         now = time.monotonic()
+        # Lần chạy trước đã thực sự phục vụ được request thì coi như ổn và xoá
+        # lịch sử bật lại: các lần thử trước đó không còn liên quan.
+        if self.became_healthy and self.started_at and now - self.started_at >= HEALTHY_AFTER:
+            self.consecutive = 0
+            self.restarts.clear()
+            self.last_error = None
         self.restarts = [t for t in self.restarts if now - t < FAST_RESTART_WINDOW]
         if len(self.restarts) >= MAX_FAST_RESTARTS:
             self.last_error = (
@@ -239,8 +365,34 @@ class ServerProcess:
                 "Dừng bật lại để tránh khoét CPU. Mở console chạy tay server.py để xem lỗi."
             )
             return False
+        self.consecutive += 1
+        if self.consecutive > MAX_TOTAL_RESTARTS:
+            self.last_error = (
+                f"Server không giữ được trạng thái sau {MAX_TOTAL_RESTARTS} lần bật lại "
+                f"(lần gần nhất cách lần trước {self.started_at and now - self.started_at:.0f}s). "
+                "Chọn 'Khởi động lại server' sau khi sửa xong, hoặc xem logs/server.log."
+            )
+            return False
         self.restarts.append(now)
         return True
+
+    def restart_delay(self) -> float:
+        """Chờ bao lâu trước khi bật lại. Lỗi lặp lại thì chờ lâu dần."""
+        idx = max(0, min(self.consecutive - 1, len(RESTART_BACKOFF) - 1))
+        return RESTART_BACKOFF[idx]
+
+    def reset_backoff(self) -> None:
+        """Xoá lịch sử bật lại — người dùng vừa sửa xong thì thử lại ngay.
+
+        Không có hàm này thì sau 20 lần lỗi, bấm nút 'Khởi động server' cũng không
+        được: `consecutive` vẫn quá trần và lần bật kế tiếp lại bị từ chối.
+        """
+        with self.lock:
+            self.consecutive = 0
+            self.restarts.clear()
+            self.last_error = None
+            self.idle = False
+            self.wake.set()
 
     def terminate(self, timeout: float = 10.0) -> None:
         """Tắt server: ưu tiên chạy endpoint admin để nó đóng Chrome cho sạch.
@@ -380,12 +532,18 @@ def run_tray(server: ServerProcess, settings: dict) -> int:
         make_icon_image(),
         "Lumi Agent",
         menu=Menu(
+            MenuItem(lambda item: f"Trạng thái: {server.status_text()}", lambda: None,
+                     enabled=lambda item: False),
+            Menu.SEPARATOR,
             MenuItem(lambda item: "Mở bảng điều khiển", lambda: open_panel(settings), default=True),
             MenuItem(lambda item: "Mở trang chat", lambda: webbrowser.open(settings["base_url"])),
             Menu.SEPARATOR,
             MenuItem(
                 lambda item: "Khởi động server",
                 lambda: start_from_menu(server),
+                # Chỉ mời bấm khi thật sự không có gì giữ cổng. Server đang
+                # khởi động thì không mời: bấm sẽ spawn thêm một cái và cái mới
+                # crash vì cổng đã bị chiếm.
                 enabled=lambda item: not server.alive(),
             ),
             MenuItem(
@@ -409,6 +567,9 @@ def run_tray(server: ServerProcess, settings: dict) -> int:
 
 def start_from_menu(server: ServerProcess) -> None:
     _log("khởi động server từ menu")
+    # Bấm nút là một quyết định có chủ ý của người dùng: xoá backoff để lần bật
+    # này không bị chặn bởi những lần lỗi trước đó.
+    server.reset_backoff()
     server.start()
 
 
@@ -417,8 +578,7 @@ def restart_server(server: ServerProcess) -> None:
     if server.alive():
         server.terminate()
     server.stopping = False
-    server.idle = False
-    server.restarts.clear()
+    server.reset_backoff()
     server.start()
 
 
@@ -470,7 +630,9 @@ def supervise(server: ServerProcess, settings: dict) -> int:
         if not server.should_restart(rc):
             _log(server.last_error or "dừng giám sát")
             return 1
-        time.sleep(1.0)
+        delay = server.restart_delay()
+        _log(f"server: {server.status_text()}; thử lại sau {delay:.0f}s")
+        time.sleep(delay)
 
 
 def main() -> int:
@@ -505,6 +667,17 @@ def main() -> int:
 
     server = ServerProcess(settings)
     if busy and not server.adopt():
+        # Cổng đã kịp vào listen nhưng `/health` chưa mở: khả năng cao nhất là
+        # chính Lumi của một lần chạy trước vẫn đang khởi động (Chrome agent có
+        # thể treo tới 900s trước khi mở cổng). Báo đúng nguyên nhân thay vì đổ
+        # hết thành "chương trình khác chiếm cổng".
+        starting = startup_server_age(settings["startup_state"])
+        if starting:
+            age, pid = starting
+            print(f"Lumi server (pid {pid}) đang khởi động, đã chờ {age:.0f}s. "
+                  "Lần chạy này sẽ không khởi động thêm để tránh tranh cổng. "
+                  "Nếu quá lâu vẫn chưa lên, xem logs/server.log.", file=sys.stderr)
+            return 3
         print("Cổng đang bị một chương trình khác (không phải Lumi) chiếm. "
               "Đóng nó, hoặc đổi port trong config.json.", file=sys.stderr)
         return 1

@@ -32,6 +32,7 @@ import os
 import random
 import re
 import secrets
+import shutil
 import sys
 import tempfile
 import threading
@@ -46,7 +47,8 @@ from curl_cffi import CurlFollow, CurlHttpVersion
 from curl_cffi.requests import AsyncSession
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 if (_src := str(Path(__file__).resolve().parent / "src")) not in sys.path:
     sys.path.insert(0, _src)
@@ -95,6 +97,78 @@ def _load_config() -> dict:
         raise RuntimeError(f"Invalid config.json: {e}") from e
 
 
+def _validate_config(raw: dict) -> str | None:
+    """Kiểm tra config bằng đúng schema của panel, trả về mô tả lỗi (hoặc None).
+
+    Cố ý KHÔNG thay `_load_config` bằng `config_store.load()`: server đọc ~15 hằng
+    số bằng `os.getenv(...) or CONFIG.get(...)`, còn `load()` đã tự áp env qua
+    `_SCALAR_ENV` — trùng hai tầng, phải chọn một. Nên ở đây chỉ *kiểm tra* để
+    báo đúng field sai thay vì để giá trị rác chạy âm thầm.
+
+    Màu đỏ thiếu: `logging` chưa cài khi module này import (`logstore.install()`
+    chạy trong `main()`), nên lỗi phải để lại cho `lifespan` in ra.
+    """
+    try:
+        config_store.AppConfig.model_validate(raw)
+    except ValidationError as e:
+        parts = [
+            f"{'.'.join(str(x) for x in err['loc']) or '(gốc)'}: {err['msg']}"
+            for err in e.errors()[:8]
+        ]
+        return f"{len(e.errors())} lỗi - " + "; ".join(parts)
+    except Exception as e:  # noqa: BLE001 - lỗi schema không được giết lúc import
+        return f"không kiểm tra được ({e})"
+    return None
+
+
+# Ngưỡng để tray chấp nhận đợi một server đang khởi động dở. 240s = gấp đôi
+# `init_timeout` mặc định 60s, đủ cho một lần khởi động bình thường nhưng không để
+# tray đợi một tiến trình đã chết.
+STARTUP_STATE_MAX_AGE = 240.0
+STARTUP_STATE_FILE = BASE_DIR / "server-startup.json"
+
+
+def _write_startup_state() -> None:
+    """Đánh dấu "đang khởi động" cho `tray.py`.
+
+    Ghi bằng file tạm rồi `replace` để `tray.py` không bao giờ đọc trúng nửa file
+    (đọc rác ra sẽ thành "cổng bị chiếm" và báo sai).
+    """
+    payload = {"pid": os.getpid(), "started_at": time.time()}
+    try:
+        tmp = STARTUP_STATE_FILE.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload), encoding="utf-8")
+        tmp.replace(STARTUP_STATE_FILE)
+    except OSError as e:
+        # Mất file đánh dấu thì chỉ mất tiện ích adopt, không hỏng server.
+        logging.warning("Không ghi được %s: %s", STARTUP_STATE_FILE.name, e)
+
+
+def _clear_startup_state() -> None:
+    try:
+        STARTUP_STATE_FILE.unlink(missing_ok=True)
+    except OSError as e:
+        logging.warning("Không xoá được %s: %s", STARTUP_STATE_FILE.name, e)
+
+
+def read_startup_state() -> dict | None:
+    """Đọc state của tiến trình KHÁC (dùng bởi `tray.py`).
+
+    Ở đây không kiểm `pid == os.getpid()` như `startup_state()` bên trong server:
+    người gọi là tray, và thứ cần xác nhận là "tiến trình ghi file còn sống".
+    """
+    try:
+        data = json.loads(STARTUP_STATE_FILE.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    pid, started = data.get("pid"), data.get("started_at")
+    if not isinstance(pid, int) or not isinstance(started, (int, float)):
+        return None
+    if time.time() - started > STARTUP_STATE_MAX_AGE:
+        return None  # quá cũ: rác của một lần chạy đã chết
+    return data
+
+
 def log_settings(cfg: dict) -> dict:
     """Cài đặt file log, đọc đúng section `logging` của config.json.
 
@@ -115,11 +189,23 @@ def log_settings(cfg: dict) -> dict:
 
 
 CONFIG = _load_config()
+_CONFIG_ERROR = _validate_config(CONFIG)
 
 AUTH_FILE = Path(os.getenv("GEMINI_AUTH_FILE") or CONFIG.get("auth_file") or "gemini-auth.json")
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL") or CONFIG.get("model") or None
 PROXY = os.getenv("GEMINI_PROXY") or CONFIG.get("proxy") or None
-STARTUP_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT") or CONFIG.get("timeout") or 60)
+# `timeout` trong config KHÔNG phải timeout của câu hỏi. Trước đây nó chỉ
+# truyền vào `client.init()` (nơi nó đúng nghĩa: chờ Gemini trả phiên), nhưng
+# panel lại dán nhãn "Tăng nếu câu hỏi dài hay bị timeout" — người dùng tăng nó
+# lên 300 rồi vẫn thấy request treo. Tách làm hai:
+#   init_timeout: chờ `client.init()` (nơi có giá trị khi đọc cookie/phiên)
+#   REQUEST_TIMEOUT: trần cho MỘT lần sinh nội dung, để một request treo không
+#                    giữ semaphore vô hạn
+# Cả hai mặc định 60 như trước để không đổi hành vi của config cũ.
+INIT_TIMEOUT = float(
+    os.getenv("GEMINI_INIT_TIMEOUT") or CONFIG.get("init_timeout") or CONFIG.get("timeout") or 60
+)
+REQUEST_TIMEOUT = float(os.getenv("GEMINI_TIMEOUT") or CONFIG.get("timeout") or 60)
 STARTUP_RETRIES = int(os.getenv("GEMINI_RETRIES") or CONFIG.get("retries") or 3)
 REFRESH_INTERVAL = float(os.getenv("GEMINI_REFRESH_INTERVAL") or CONFIG.get("refresh_interval") or 300)
 HEALER_INTERVAL = int(os.getenv("GEMINI_HEALER_INTERVAL") or CONFIG.get("healer_interval") or 30)
@@ -355,7 +441,7 @@ async def client_init() -> None:
     last_err = None
     for attempt in range(1, STARTUP_RETRIES + 1):
         try:
-            await client.init(timeout=STARTUP_TIMEOUT, auto_refresh=True)
+            await client.init(timeout=INIT_TIMEOUT, auto_refresh=True)
             last_err = None
             break
         except AuthError as e:
@@ -403,7 +489,7 @@ async def reload_client() -> bool:
                         pass
                 candidate = build_client()
                 candidate.refresh_interval = REFRESH_INTERVAL
-                await candidate.init(timeout=STARTUP_TIMEOUT, auto_refresh=True)
+                await candidate.init(timeout=INIT_TIMEOUT, auto_refresh=True)
                 if candidate.account_status == AccountStatus.UNAUTHENTICATED:
                     raise AuthError("Session is not authenticated")
                 last_err = None
@@ -530,6 +616,11 @@ async def _close_old_when_idle(old, cap: float = 900.0) -> None:
 
 async def auth_watchdog() -> None:
     """Detect gemini-auth.json changes on disk and reload the client."""
+    # Bắt buộc phải có: dòng dưới gán `_last_auth_mtime`, và Python coi một
+    # biến bị gán trong hàm là biến LOCAL của hàm đó. Không có `global`, lần lặp
+    # đầu tiên sẽ ném UnboundLocalError và task chết lặng lẽ — tức là việc phát
+    # hiện thay đổi của gemini-auth.json không bao giờ chạy.
+    global _last_auth_mtime
     while True:
         await asyncio.sleep(2.0)
         try:
@@ -687,22 +778,34 @@ async def _shutdown_agent_browser(browser_cfg: dict) -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    global client, _client_lock, _guard
+    global client, _client_lock, _guard, _TMP_DIR
     # uvicorn tự cấu hình logging trong Server.run(), tức là SAU main() gọi
     # logstore.install(). Nên phải gắn nốt handler vào logger của uvicorn ở đây.
     logstore.attach_uvicorn(LOG_LEVEL)
+    if _CONFIG_ERROR:
+        logging.error(
+            "config.json có giá trị sai kiểu, server đang dùng giá trị thô "
+            "(thiếu kiểm tra an toàn). Sửa file rồi khởi động lại: %s", _CONFIG_ERROR
+        )
     if ADMIN_ENABLED and not ADMIN_TOKEN:
         logging.error(
             "admin.enabled=true nhưng admin.token rỗng -> /admin sẽ trả 404. "
             "Chạy `python server.py --gen-admin-token` để sinh token."
         )
+    _sweep_stale_tmp()
     _client_lock = asyncio.Lock()
     _guard = _ConcurrencyGuard(MAX_CONCURRENT, MAX_QUEUE, QUEUE_TIMEOUT)
     logging.info(
         "Concurrency guard: max_concurrent=%d, max_queue=%d, queue_timeout=%ss",
         MAX_CONCURRENT, MAX_QUEUE, QUEUE_TIMEOUT,
     )
-    await client_init()
+    # Ghi TRƯỚC `client_init()`: từ đây tới khi `/health` mở cổng có thể mất hàng
+    # phút, và tray cần biết "đang khởi động" để không tưởng là cổng bị chiếm.
+    _write_startup_state()
+    try:
+        await client_init()
+    finally:
+        _clear_startup_state()
     watchdog = asyncio.create_task(auth_watchdog())
     healer = asyncio.create_task(session_healer())
     browser_task: asyncio.Task | None = None
@@ -724,6 +827,11 @@ async def lifespan(_: FastAPI):
     healer.cancel()
     if client:
         await client.close()
+    # Dọn thư mục tạm của tiến trình này (nếu có ảnh nào được tải lên).
+    if _TMP_DIR is not None:
+        shutil.rmtree(_TMP_DIR, ignore_errors=True)
+        _TMP_DIR = None
+    _clear_startup_state()
     if browser_cfg is not None and CLOSE_ON_EXIT:
         await _shutdown_agent_browser(browser_cfg)
     elif browser_cfg is not None:
@@ -736,7 +844,8 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Gemini-API OpenAI-compatible server",
-    docs_url="/docs",
+    docs_url=None,
+    redoc_url=None,
     openapi_url=None,
     lifespan=lifespan,
 )
@@ -795,6 +904,30 @@ def _admin_state() -> dict:
         "auth_age_sec": _auth_age_sec(),
         "browser": _agent_brief(),
     }
+
+
+class _ReleasingStreamingResponse(StreamingResponse):
+    """StreamingResponse luôn trả slot concurrency, kể cả khi client biến mất.
+
+    Starlette gửi `http.response.start` TRƯỚC rồi mới chạy background task, và
+    `Response.__call__` không có try/finally. Nên nếu `send()` đầu tiên raise —
+    tức client đã ngắt kết nối — thì generator chưa từng được iterate (`finally`
+    bên trong không chạy) và background task cũng chưa tới lượt. Slot semaphore
+    mất vĩnh viễn; đủ vài lần là server 429 hỏng cho tới khi restart.
+
+    `finally` ở `__call__` là chỗ duy nhất chắc chắn chạy trên mọi đường thoát:
+    hoàn thành, client disconnect, exception, hay task bị cancel.
+    """
+
+    def __init__(self, content, *, release, **kwargs) -> None:
+        super().__init__(content, media_type="text/event-stream", **kwargs)
+        self._release = release
+
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            await self._release()
 
 
 if ADMIN_ENABLED and ADMIN_TOKEN:
@@ -883,7 +1016,70 @@ def _iter_images(content):
 
 
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
-_TMP_DIR = Path(tempfile.mkdtemp(prefix="gemini_server_"))
+_TMP_DIR_PREFIX = "lumi_agent_"
+_TMP_DIR: Path | None = None
+
+
+def tmp_dir() -> Path:
+    """Thư mục chứa file tạm cho upload. Tạo lazily, không tạo lúc import.
+
+    Trước đây `mkdtemp` chạy ở tầng module, nên chỉ cần `import server` (kể cả
+    trong test) cũng để lại một thư mục rác không ai dọn. Ở đây thư mục chỉ sinh
+    khi thật sự có ảnh cần upload, và `lifespan` dọn khi tắt.
+    """
+    global _TMP_DIR
+    if _TMP_DIR is None:
+        _TMP_DIR = Path(tempfile.mkdtemp(prefix=_TMP_DIR_PREFIX))
+    return _TMP_DIR
+
+
+def _sweep_stale_tmp(max_age_h: float = 24.0) -> int:
+    """Dọn thư mục tạm của các lần chạy trước bị crash cứng (không qua `lifespan`).
+
+    Server bị `taskkill /F` hoặc máy mất điện thì không ai chạy cleanup, nên file
+    tạm tích tụ mãi trong `%TEMP%`. Ở đây quét theo tuổi nên không đụng vào
+    thư mục của một server đang chạy song song.
+    """
+    removed = 0
+    cutoff = time.time() - max_age_h * 3600
+    root = Path(tempfile.gettempdir())
+    try:
+        candidates = list(root.glob(_TMP_DIR_PREFIX + "*"))
+    except OSError:
+        return 0
+    for d in candidates:
+        try:
+            if not d.is_dir() or d.stat().st_mtime > cutoff:
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            removed += 1
+        except OSError:
+            continue
+    if removed:
+        logging.info("Đã dọn %d thư mục tạm cũ (%s*)", removed, _TMP_DIR_PREFIX)
+    return removed
+
+
+def _cleanup_tmpfiles(tmpfiles: list[Path] | None) -> None:
+    """Xoá file tạm, nuốt lỗi. Không được phép làm hỏng việc trả slot phía sau.
+
+    Windows raise `PermissionError` khi file còn bị giữ mở (upload chưa xong,
+    antivirus đang quét). Trong `finally` của request, `unlink` nằm TRƯỚC
+    `guard.__aexit__`; một lỗi OS lạ đủ để rò semaphore vĩnh viễn và server hết
+    slot sau vài lần. Vì vậy dọn file phải tự nuốt lỗi, và thứ tự giữ nguyên là:
+    dọn file -> unmark flight -> trả slot.
+    """
+    for tmp in tmpfiles or ():
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError as e:
+            logging.warning("Không xoá được file tạm %s: %s", tmp.name, e)
+
+
+# Giới hạn tải ảnh. Không có thì một URL nặng làmOOM giết server, còn một URL treo
+# giữ slot concurrency vô hạn (đường tải ảnh không đi qua watchdog của client).
+IMAGE_FETCH_TIMEOUT = float(os.getenv("GEMINI_IMAGE_TIMEOUT") or 20)
+MAX_IMAGE_BYTES = int(os.getenv("GEMINI_IMAGE_MAX_BYTES") or 10 * 1024 * 1024)
 
 
 def _content_type_ext(content_type: str | None) -> str:
@@ -914,32 +1110,74 @@ def _url_ext(src: str) -> str | None:
 async def _load_image(src: str) -> tuple[bytes, str]:
     if src.startswith("data:"):
         head, _, b64 = src.partition(",")
-        data = base64.b64decode(b64)
+        # base64 nở 4/3, nên chặn trên chuỗi đã mã hoá trước khi decode: decode
+        # một payload 500MB sẽ giết tiến trình, không phải chỉ chậm.
+        if len(b64) > (MAX_IMAGE_BYTES * 4) // 3 + 4:
+            raise ValueError(
+                f"Inline image larger than {MAX_IMAGE_BYTES // (1024 * 1024)}MB."
+            )
+        try:
+            data = base64.b64decode(b64)
+        except (ValueError, TypeError) as e:
+            raise ValueError("Invalid base64 in data: image URL") from e
+        if len(data) > MAX_IMAGE_BYTES:
+            raise ValueError(
+                f"Inline image larger than {MAX_IMAGE_BYTES // (1024 * 1024)}MB."
+            )
         mime = head.split(":", 1)[1].split(";", 1)[0] if ":" in head else ""
         ext = _content_type_ext(mime) or _sniff_ext(data)
         return data, ext
     parsed = urlparse(src)
     if parsed.scheme in ("http", "https"):
+        # `AsyncSession` mặc định `timeout=None`: một URL treo sẽ giữ slot
+        # concurrency vô hạn mà không đi qua watchdog của client. Đường này tải
+        # vào RAM, nên phải có cả trần thời gian lẫn trần dung lượng.
         async with AsyncSession(
             impersonate=BROWSER_TYPE,
             allow_redirects=CurlFollow.SAFE,
             http_version=CurlHttpVersion.NONE,
         ) as session:
-            resp = await session.get(src)
+            try:
+                resp = await asyncio.wait_for(session.get(src), timeout=IMAGE_FETCH_TIMEOUT)
+            except (TimeoutError, asyncio.TimeoutError) as e:
+                raise ValueError(
+                    f"Image download timed out after {IMAGE_FETCH_TIMEOUT:g}s: {src}"
+                ) from e
             resp.raise_for_status()
-            ext = _content_type_ext(resp.headers.get("content-type")) or _url_ext(src) or _sniff_ext(resp.content)
-            return resp.content, ext
+            # Content-Length có thể sai hoặc vắng, nên vẫn đọc chunked và tự dừng.
+            declared = resp.headers.get("content-length")
+            if declared and declared.isdigit() and int(declared) > MAX_IMAGE_BYTES:
+                raise ValueError(
+                    f"Image too large ({int(declared) / 1e6:.1f}MB > "
+                    f"{MAX_IMAGE_BYTES // (1024 * 1024)}MB): {src}"
+                )
+            buf = bytearray()
+            async for chunk in resp.aiter_content():
+                buf.extend(chunk)
+                if len(buf) > MAX_IMAGE_BYTES:
+                    raise ValueError(
+                        f"Image larger than {MAX_IMAGE_BYTES // (1024 * 1024)}MB: {src}"
+                    )
+            data = bytes(buf)
+            ext = _content_type_ext(resp.headers.get("content-type")) or _url_ext(src) or _sniff_ext(data)
+            return data, ext
     raise ValueError(f"Cannot load image source: {src}")
 
 
 async def _prepare_files(images: list[str]) -> tuple[list[str], list[Path]]:
     files, tmpfiles = [], []
-    for src in images:
-        data, ext = await _load_image(src)
-        tmp = _TMP_DIR / f"{uuid.uuid4().hex}{ext}"
-        tmp.write_bytes(data)
-        tmpfiles.append(tmp)
-        files.append(str(tmp))
+    try:
+        for src in images:
+            data, ext = await _load_image(src)
+            tmp = tmp_dir() / f"{uuid.uuid4().hex}{ext}"
+            tmp.write_bytes(data)
+            tmpfiles.append(tmp)
+            files.append(str(tmp))
+    except BaseException:
+        # Đã ghi file tạm cho ảnh trước mà ảnh sau lỗi thì phải dọn ngay, chứ đợi
+        # `finally` của caller thì request này đã trả lỗi 400 rồi.
+        _cleanup_tmpfiles(tmpfiles)
+        raise
     return files, tmpfiles
 
 
@@ -993,6 +1231,7 @@ def build_prompt(messages: list[dict]) -> str:
 
 CHAT_HTML = Path(__file__).with_name("chat.html")
 LOGO_PNG = Path(__file__).with_name("logo.png")
+VENDOR_DIR = Path(__file__).with_name("vendor")
 _logo_png_cache: bytes | None = None
 _favicon_cache: bytes | None = None
 
@@ -1045,6 +1284,19 @@ def _favicon_ico() -> bytes:
         _logo_image().save(ico, format="ICO", sizes=[(16, 16), (32, 32), (48, 48)])
         _favicon_cache = ico.getvalue()
     return _favicon_cache
+
+
+# Thư viện tĩnh đi kèm repo (KaTeX cho chat.html). Mount ở mức module để có
+# trong app trước khi route nào chạy, và chỉ khi thư mục thực sự tồn tại:
+# thiếu vendor/ thì server vẫn phải lên được, chỉ là không có công thức đẹp.
+# Đăng ký thêm MIME cho font: registry mimetypes trên Windows không biết
+# .woff2, nên StaticFiles sẽ phục vụ font KaTeX là application/octet-stream.
+for _ext, _type in ((".woff2", "font/woff2"), (".woff", "font/woff"),
+                    (".ttf", "font/ttf")):
+    mimetypes.add_type(_type, _ext)
+
+if VENDOR_DIR.is_dir():
+    app.mount("/vendor", StaticFiles(directory=str(VENDOR_DIR)), name="vendor")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -1383,10 +1635,9 @@ async def _generate(
                 await _ensure_client()
                 c = client
             await _mark_flight(c)
-            output = await c.generate_content(
-                prompt,
-                files=files or None,
-                model=model,
+            output = await asyncio.wait_for(
+                c.generate_content(prompt, files=files or None, model=model),
+                timeout=REQUEST_TIMEOUT,
             )
     except (_QueueFull, _QueueTimeout) as e:
         logging.warning("Concurrency guard rejected generate: %s", e)
@@ -1397,8 +1648,7 @@ async def _generate(
         logging.error("Generate failed: %s", e)
         raise _as_http_error(e)
     finally:
-        for tmp in tmpfiles:
-            tmp.unlink(missing_ok=True)
+        _cleanup_tmpfiles(tmpfiles)
         await _unmark_flight(c)
 
     text = output.text
@@ -1496,8 +1746,31 @@ async def chat_completions(req: ChatRequest):
         except (_QueueFull, _QueueTimeout) as e:
             raise _as_http_error(e) from None
 
+        released = False
+        flight = None
+
+        async def _release() -> None:
+            """Trả slot concurrency + dọn file tạm, đúng một lần.
+
+            Idempotent vì được hai bên gọi: `finally` của generator và
+            `__call__` của `_ReleasingStreamingResponse`.
+            """
+            nonlocal released
+            if released:
+                return
+            released = True
+            try:
+                _cleanup_tmpfiles(tmpfiles)
+                await _unmark_flight(flight)
+            except Exception:
+                # Dọn file tạm và gỡ flight đều chỉ là việc phụ; lỗi ở đó không
+                # được phép nuốt semaphore — mất slot thì server 429 hỏng hẳn.
+                logging.exception("Lỗi khi dọn tài nguyên sau stream (slot vẫn được trả).")
+            finally:
+                await guard.__aexit__(None, None, None)
+
         async def stream():
-            c = None
+            nonlocal flight
             try:
                 yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
                 if not await _wait_for_client():
@@ -1507,6 +1780,7 @@ async def chat_completions(req: ChatRequest):
                 if c is None:
                     await _ensure_client()
                     c = client
+                flight = c
                 await _mark_flight(c)
                 async for chunk in c.generate_content_stream(
                     prompt,
@@ -1521,13 +1795,10 @@ async def chat_completions(req: ChatRequest):
                 logging.error("Stream failed: %s", e)
                 yield f"data: {json.dumps({'error': {'message': str(e), 'type': 'server_error'}})}\n\n"
             finally:
-                for tmp in tmpfiles:
-                    tmp.unlink(missing_ok=True)
-                await _unmark_flight(c)
-                await guard.__aexit__(None, None, None)
+                await _release()
             yield "data: [DONE]\n\n"
 
-        return StreamingResponse(stream(), media_type="text/event-stream")
+        return _ReleasingStreamingResponse(stream(), release=_release)
 
     c = None
     try:
@@ -1544,10 +1815,9 @@ async def chat_completions(req: ChatRequest):
                 await _ensure_client()
                 c = client
             await _mark_flight(c)
-            output = await c.generate_content(
-                prompt,
-                files=files or None,
-                model=model,
+            output = await asyncio.wait_for(
+                c.generate_content(prompt, files=files or None, model=model),
+                timeout=REQUEST_TIMEOUT,
             )
     except (_QueueFull, _QueueTimeout) as e:
         logging.warning("Concurrency guard rejected chat completion: %s", e)
@@ -1558,8 +1828,7 @@ async def chat_completions(req: ChatRequest):
         logging.error("Generate failed: %s", e)
         raise _as_http_error(e)
     finally:
-        for tmp in tmpfiles:
-            tmp.unlink(missing_ok=True)
+        _cleanup_tmpfiles(tmpfiles)
         await _unmark_flight(c)
 
     return _completion_body(cid, created, model, output.text, None, stream=False)

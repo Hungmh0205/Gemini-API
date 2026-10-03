@@ -373,6 +373,39 @@ async def profiles():
     return out
 
 
+async def _close_chrome_bounded(bcfg: dict, user_data_dir: str) -> tuple[bool, str]:
+    """Gọi `close_agent_chrome` có trần thời gian, trả về `(ok, note)`.
+
+    `server.py` đã bọc hàm này bằng `asyncio.wait_for` (`_shutdown_agent_browser`),
+    nhưng hai endpoint dưới đây thì không — mà chúng giữ `_browser_lock`, nên một
+    lần treo là `/api/browser/start` và `/api/browser/restart` xếp hàng vô tận.
+
+    Bên trong `close_agent_chrome` gọi `browser_pids()` tối đa 3 lần, mỗi lần
+    spawn PowerShell (`timeout=15`). Nếu WMI kẹt thì `subprocess.run` ném
+    `TimeoutExpired`; không bắt thì endpoint trả 500 thay vì thông báo cho
+    người dùng biết phải xử lý tay.
+    """
+    budget = float(bcfg.get("close_timeout") or 25) + 60.0
+    try:
+        ok = await asyncio.wait_for(
+            asyncio.to_thread(
+                chrome_launcher.close_agent_chrome,
+                user_data_dir,
+                float(bcfg.get("close_timeout") or 25),
+            ),
+            timeout=budget,
+        )
+        return bool(ok), ""
+    except (TimeoutError, subprocess.TimeoutExpired):
+        log.warning("close_agent_chrome treo quá %.0fs (%s)", budget, user_data_dir)
+        return False, (
+            f"Chrome không phản hồi trong {budget:.0f}s. Thử `python chrome_launcher.py --reset`."
+        )
+    except Exception as e:
+        log.error("Lỗi khi đóng Chrome agent: %s", e)
+        return False, f"Lỗi khi đóng Chrome agent: {e}"
+
+
 @router.post("/api/browser/start", dependencies=_auth)
 async def browser_start():
     bcfg = _browser_cfg()
@@ -414,10 +447,12 @@ async def browser_stop():
         )
     async with _browser_lock:
         chrome_launcher.set_keep_alive(False)
-        ok = await asyncio.to_thread(
-            chrome_launcher.close_agent_chrome, target.user_data_dir, float(bcfg["close_timeout"])
-        )
-    return {"status": "stopped" if ok else "still-running", "profile": target.user_data_dir}
+        ok, note = await _close_chrome_bounded(bcfg, target.user_data_dir)
+    out: dict[str, Any] = {"status": "stopped" if ok else "still-running",
+                           "profile": target.user_data_dir}
+    if note:
+        out["note"] = note
+    return out
 
 
 @router.post("/api/browser/restart", dependencies=_auth)
@@ -487,11 +522,12 @@ async def browser_reset(request: Request):
     async with _browser_lock:
         chrome_launcher.set_keep_alive(False)
         if chrome_launcher.browser_pids(target.user_data_dir):
-            ok = await asyncio.to_thread(
-                chrome_launcher.close_agent_chrome, target.user_data_dir, float(bcfg["close_timeout"])
-            )
+            ok, note = await _close_chrome_bounded(bcfg, target.user_data_dir)
             if not ok:
-                raise HTTPException(status_code=409, detail="Không đóng được Chrome agent. Đóng tay rồi thử lại.")
+                raise HTTPException(
+                    status_code=409,
+                    detail=note or "Không đóng được Chrome agent. Đóng tay rồi thử lại.",
+                )
 
         auth = BASE_DIR / str(_load_cfg().auth_file)
 
@@ -553,7 +589,7 @@ async def server_restart():
         raise HTTPException(
             status_code=409,
             detail="Server không chạy dưới tray.py nên không tự restart được. "
-                   "Chạy `python tray.py` thay vì `run_server.bat`.",
+                   "Chạy `python tray.py` thay vì `run_server-debug.bat`.",
         )
     HOOK.request_restart()
     return {"status": "restarting"}

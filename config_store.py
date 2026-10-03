@@ -43,6 +43,7 @@ _SCALAR_ENV = {
     "model": "GEMINI_MODEL",
     "proxy": "GEMINI_PROXY",
     "timeout": "GEMINI_TIMEOUT",
+    "init_timeout": "GEMINI_INIT_TIMEOUT",
     "retries": "GEMINI_RETRIES",
     "refresh_interval": "GEMINI_REFRESH_INTERVAL",
     "healer_interval": "GEMINI_HEALER_INTERVAL",
@@ -165,6 +166,7 @@ class AppConfig(BaseModel):
     model: str | None = None
     proxy: str = ""
     timeout: float = 60.0
+    init_timeout: float = 60.0
     retries: int = 3
     refresh_interval: float = 300.0
     healer_interval: int = 30
@@ -204,7 +206,7 @@ class AppConfig(BaseModel):
             raise ValueError("giá trị phải >= 1")
         return v
 
-    @field_validator("timeout", "refresh_interval", "queue_timeout", "reload_cooldown")
+    @field_validator("timeout", "init_timeout", "refresh_interval", "queue_timeout", "reload_cooldown")
     @classmethod
     def _positive_float(cls, v: float) -> float:
         if v <= 0:
@@ -340,7 +342,7 @@ def _validate(raw: dict) -> AppConfig:
 
 
 _INT_FIELDS = ("port", "retries", "healer_interval", "max_concurrent", "max_queue")
-_FLOAT_FIELDS = ("timeout", "refresh_interval", "queue_timeout", "reload_cooldown", "drain_grace")
+_FLOAT_FIELDS = ("timeout", "init_timeout", "refresh_interval", "queue_timeout", "reload_cooldown", "drain_grace")
 
 
 def apply_env(cfg: AppConfig) -> AppConfig:

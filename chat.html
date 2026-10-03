@@ -5,6 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Gemini Chat Test</title>
 <link rel="icon" href="/favicon.ico" sizes="any">
+<!-- KaTeX: bản vendor trong repo, KHÔNG dùng CDN (dự án chạy offline). -->
+<link rel="stylesheet" href="/vendor/katex/katex.min.css">
 <style>
   :root { --bg:#0f1115; --panel:#161a22; --bubble:#1f2630; --accent:#4f8cff; --text:#e6e9ef; --muted:#9aa3b2; }
   * { box-sizing: border-box; }
@@ -33,6 +35,50 @@
   #attach { background:#2a3242; }
   #send:disabled { opacity:.5; cursor:default; }
   .hint { font-size:11px; color:var(--muted); align-self:center; }
+
+  /* ---------- Markdown trong tin nhắn ----------
+     `.msg` mặc định `white-space:pre-wrap` để hiện nguyên văn bản thô. Khi bật
+     markdown thì phải trả lại `normal`, nếu không mọi xuống dòng trong `<p>` và
+     `<li>` sẽ bị nhân đôi. */
+  .md { white-space:normal; }
+  .md > *:first-child { margin-top:0; }
+  .md > *:last-child { margin-bottom:0; }
+  .md p { margin:0 0 8px; }
+  .md h1,.md h2,.md h3,.md h4,.md h5,.md h6 { margin:12px 0 6px; line-height:1.3; }
+  .md h1 { font-size:19px; } .md h2 { font-size:17px; }
+  .md h3 { font-size:15px; } .md h4,.md h5,.md h6 { font-size:14px; }
+  .md ul,.md ol { margin:0 0 8px; padding-left:22px; }
+  .md li { margin:2px 0; }
+  .md li > ul, .md li > ol { margin:2px 0; }
+  .md code { background:#0d1016; border:1px solid #2a3242; border-radius:4px; padding:1px 5px; font-family:Consolas,"Cascadia Mono",monospace; font-size:12.5px; }
+  .md-pre { background:#0d1016; border:1px solid #2a3242; border-radius:8px; padding:10px 12px; overflow-x:auto; margin:0 0 8px; position:relative; }
+  .md-pre code { background:none; border:none; padding:0; white-space:pre; display:block; }
+  .md-pre[data-lang]::before { content:attr(data-lang); position:absolute; top:6px; right:8px; font-size:10px; color:var(--muted); text-transform:uppercase; letter-spacing:.4px; }
+  .md blockquote { margin:0 0 8px; padding:2px 0 2px 12px; border-left:3px solid #2a3242; color:var(--muted); }
+  .md table { border-collapse:collapse; margin:0 0 8px; font-size:13px; display:block; overflow-x:auto; max-width:100%; }
+  .md th,.md td { border:1px solid #2a3242; padding:5px 9px; text-align:left; }
+  .md th { background:#0d1016; }
+  .md hr { border:none; border-top:1px solid #232a36; margin:10px 0; }
+  .md a { color:var(--accent); }
+  .md-img { max-width:100%; border-radius:8px; display:block; margin:6px 0; }
+  .md del { color:var(--muted); }
+
+  /* Toán học (KaTeX). Công thức rộng phải cuộn ngang, nếu không tràn ngang
+     làm cả khung chat giãn ra. */
+  .md .katex { font-size:1.06em; }
+  .md-mathblock { display:block; overflow-x:auto; overflow-y:hidden; margin:8px 0; padding:2px 0; }
+  .md-mathblock .katex-display { margin:0; }
+  /* Fallback khi KaTeX không tải được hoặc LaTeX sai cú pháp: hiện nguyên
+     mã nguồn thay vì mất trắng. */
+  .md-raw { color:#ffb4a2; background:#2a1b1b; border:1px solid #5a2f2a; white-space:pre-wrap; }
+  /* [cite: N] của Gemini -> chip trích dẫn gọn như web Gemini. */
+  .md-cite { color:var(--accent); font-size:.72em; font-weight:600; cursor:help; margin-left:1px; }
+
+  /* Chế độ raw: hiện đúng chuỗi Gemini trả về, không diễn giải gì cả. */
+  #messages.raw .md { white-space:pre-wrap; font-family:Consolas,"Cascadia Mono",monospace; font-size:12.5px; color:#cbd3e1; }
+  #messages.raw .md-pre { white-space:normal; }
+
+  #mdToggle.on { background:#2f6b4f; color:#fff; }
 </style>
 </head>
 <body>
@@ -41,6 +87,7 @@
   <h1>Gemini Chat Test</h1>
   <input id="apiKey" placeholder="API Key (lưu tự động)">
   <input id="model" placeholder="model (để trống = mặc định)" value="gemini-flash">
+  <button id="mdToggle" class="on" title="Bật/tắt hiển thị markdown. Tắt để xem nguyên văn Gemini trả về.">Markdown</button>
   <button id="clear" style="background:#2a3242;border:none;color:#fff;padding:6px 12px;border-radius:8px">Reset</button>
 </header>
 
@@ -55,6 +102,8 @@
 
 <input type="file" id="file" accept="image/*" multiple hidden>
 
+<!-- KaTeX phải nạp TRƯỚC script chính: renderer bên dưới gọi katex.render(). -->
+<script src="/vendor/katex/katex.min.js"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -66,6 +115,295 @@ $("apiKey").value = apiKey;
 $("apiKey").addEventListener("input", () => {
   localStorage.setItem("gemini_api_key", $("apiKey").value.trim());
 });
+
+/* =============================================================================
+ * Markdown
+ *
+ * Tự viết thay vì kéo marked.js từ CDN: dự án này cố ý chạy offline (xem
+ * README), nên một thẻ <script src="https://..."> là mất trắng toàn bộ khả
+ * năng render khi máy không có mạng — tức là hỏng đúng lúc bạn debug.
+ *
+ * Thứ tự cố ý: escape HTML TRƯỚC, rồi mới chèn thẻ. Nội dung do Gemini sinh ra
+ * và server là proxy của nó, nên không thể tin: nếu render trực tiếp chuỗi
+ * gốc thì một câu trả lời chứa <img onerror=...> hay [x](javascript:...) sẽ
+ * chạy được trong máy người dùng.
+ * ========================================================================== */
+let MD_ON = localStorage.getItem("gemini_md") !== "0";
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+// Chỉ cho http/https/mailto. `javascript:` bị chặn ở đây chứ không phải ở
+// chỗ dùng, để không sót đường nào sau này.
+function safeUrl(u) {
+  const s = String(u).trim();
+  return /^(https?:\/\/|mailto:)/i.test(s) ? s : "";
+}
+
+/* Render một công thức bằng KaTeX, tự hạ nếu KaTeX lỗi/lỡ vendor.
+   `displayMode` bọc trong <span class="md-mathblock"> chứ không để KaTeX tự sinh
+   <div class="katex-display">: phần lớn công thức nằm giữa <p>, mà <div> nằm
+   trong <p> là HTML không hợp lệ và trình duyệt sẽ tự dựng lại cây DOM. */
+function renderMath(latex, display) {
+  const fb = "<code class='md-raw'>" + esc(latex) + "</code>";
+  if (typeof katex === "undefined") return fb;
+  try {
+    const html = katex.renderToString(latex, {
+      displayMode: !!display,
+      throwOnError: false,   // lỗi cú pháp -> hiện LaTeX gốc, không ném exception
+      strict: "ignore",       // chấp nhận cả mã LaTeX "không chuẩn" Gemini hay sinh
+      trust: false,           // KHÔNG cho \href/\url mở javascript: hay nhúng frame
+      maxSize: 40,            // chặn script siêu lớn gây treo tab
+      maxExpand: 1000,
+      output: "html",
+    });
+    return display ? '<span class="md-mathblock">' + html + "</span>" : html;
+  } catch (e) {
+    return fb;
+  }
+}
+
+/* Render phần trong một dòng. Input là TEXT THÔ, tự escape bên trong.
+
+   Thứ tự rất quan trọng và không thể đảo:
+     1. code inline  -> placeholder   (backtick là biên, `$` bên trong là text)
+     2. $$...$$      -> placeholder   (trước $...$ vì $$ chứa $)
+     3. $...$        -> placeholder
+     4. escape phần còn lại
+     5. bold/italic/link/...
+     6. render lại placeholder
+   Phải tách math TRƯỚC khi escape: LaTeX có ký tự `&` và `<` (`\begin{cases}`,
+   `\begin{array}{cc}`), escape trước sẽ biến chúng thành `&amp;` `&lt;` và
+   KaTeX sẽ in ra đúng những ký tự đó thay vì canh chỉnh. */
+function inlineMd(raw) {
+  let t = String(raw == null ? "" : raw);
+  const toks = [];
+  const hold = (kind, val) => "\u0000T" + (toks.push([kind, val]) - 1) + "\u0000";
+
+  t = t.replace(/`([^`\n]+)`/g, (_, c) => hold("code", c));
+  // Cặp `$$` nhiều dòng đã được renderMarkdown xử lý ở tầng block; ở đây chỉ
+  // còn trường hợp cả hai dấu nằm trên cùng một dòng.
+  t = t.replace(/\$\$([^$]+?)\$\$/g, (_, m) => hold("dm", m));
+  // `$` trong "$5 và $10" là tiền tệ, không phải toán. Ba chốt chặn:
+  //   `(?!\s)`  sau dấu mở: không mở bằng khoảng trắng -> loại "a $ b"
+  //   `(?<![\s\\])` trước dấu đóng: không đóng bằng khoảng trắng
+  //   `(?!\d)`  sau dấu đóng: "$5 và $10" -> $10 không phải toán
+  t = t.replace(/(^|[^\\$])\$(?!\s)((?:\\.|[^$\n\\])+?)(?<![\s\\])\$(?!\d)/g,
+    (_, pre, m) => pre + hold("m", m));
+  // Gemini đính kèm grounding bằng [cite: 1] ngay trong text. Web Gemini biến
+  // nó thành chip trích dẫn; ta không có URL nguồn nên hiện superscript số thứ
+  // tự, thành text thô thì đọc rất khó chịu.
+  t = t.replace(/\[cite:\s*([\d\s,]+)\]/gi,
+    (_, nums) => hold("cite", nums.replace(/[^0-9,]/g, "")));
+
+  let e = esc(t);
+  e = e.replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, (m, alt, url) => {
+    const u = safeUrl(url);
+    return u ? '<img class="md-img" alt="' + alt + '" src="' + u + '">' : m;
+  });
+  e = e.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, label, url) => {
+    const u = safeUrl(url);
+    return u ? '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + label + "</a>" : m;
+  });
+
+  e = e.replace(/\*\*\*([^*\n]+)\*\*\*/g, "<strong><em>$1</em></strong>");
+  e = e.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+  e = e.replace(/__([^_\n]+)__/g, "<strong>$1</strong>");
+  e = e.replace(/~~([^~\n]+)~~/g, "<del>$1</del>");
+  // Chỉ nhận `*` cho italic, cố ý KHÔNG nhận `_`: Gemini hay viết
+  // `some_variable_name` và `_` làm viền sẽ nghiêng hết từ trong ngoặc.
+  // Nhóm 1 là ký tự biên (để giữ lại), nhóm 2 là phần BÊN TRONG dấu sao — bắt
+  // nhầm nhóm này sẽ ra `<em>*chữ*</em>` và hiện ra dấu `*` thật.
+  e = e.replace(/(^|[\s([{>*~])\*([^*\n]+)\*(?=$|[\s)\]}.!?,;:*~])/g, "$1<em>$2</em>");
+
+  return e.replace(/\u0000T(\d+)\u0000/g, (_, n) => {
+    const [kind, val] = toks[+n];
+    if (kind === "code") return "<code>" + esc(val) + "</code>";
+    if (kind === "cite") return '<sup class="md-cite" title="Nguồn ' +
+      val.replace(/,/g, ", ") + '">' + val + "</sup>";
+    return renderMath(val, kind === "dm");
+  });
+}
+
+function splitRow(line) {
+  return line.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split(/(?<!\\)\|/).map((c) => c.trim());
+}
+
+/* Render một khối danh sách đệ quy để hỗ trợ gạch đầu dòng lồng nhau.
+   Trả về chuỗi (không push vào mảng) để khối con có thể nhúng thẳng vào <li>
+   của mục cha — nếu đẩy ra ngoài, ta sinh ra <ul><li>a</li><ul>...</ul></ul>,
+   tức <ul> là anh em của <li>, mà HTML không cho phép. */
+function renderList(items, ordered) {
+  // Trừ đi thụt lề nhỏ nhất trước. Bắt buộc: giữ thụt lề tuyệt đối thì một
+  // danh sách mọi dòng đều thụt (rất hay gặp) sẽ bị coi là "dòng lồng" ở mọi
+  // cấp và đệ quy không bao giờ dừng.
+  let base = Infinity;
+  for (const it of items) base = Math.min(base, it[0]);
+  if (!isFinite(base)) return "";
+  const tag = ordered ? "ol" : "ul";
+  const out = ["<" + tag + ">"];
+  let i = 0;
+  while (i < items.length) {
+    if (items[i][0] - base >= 2) { i++; continue; } // dư thừa, đã xử lý ở nhánh dưới
+    let html = inlineMd(items[i][1]);
+    i++;
+    if (i < items.length && items[i][0] - base >= 2) {
+      const kids = [];
+      while (i < items.length && items[i][0] - base >= 2) { kids.push(items[i]); i++; }
+      html += renderList(kids, false);
+    }
+    out.push("<li>" + html + "</li>");
+  }
+  out.push("</" + tag + ">");
+  return out.join("");
+}
+
+function renderMarkdown(src) {
+  const lines = String(src == null ? "" : src).replace(/\r\n?/g, "\n").split("\n");
+  const out = [];
+  let i = 0;
+
+  while (i < lines.length) {
+    const line = lines[i];
+
+    // ---- khối code ``` ... ```
+    const fence = line.match(/^\s{0,3}(`{3,}|~{3,})\s*([\w+#.-]*)\s*$/);
+    if (fence) {
+      const mark = fence[1][0], minLen = fence[1].length, lang = fence[2];
+      const buf = [];
+      i++;
+      while (i < lines.length) {
+        const close = lines[i].match(/^\s{0,3}(`{3,}|~{3,})\s*$/);
+        if (close && close[1][0] === mark && close[1].length >= minLen) { i++; break; }
+        buf.push(lines[i]); i++;
+      }
+      out.push('<pre class="md-pre"' + (lang ? ' data-lang="' + esc(lang) + '"' : "") +
+               "><code>" + esc(buf.join("\n")) + "</code></pre>");
+      continue;
+    }
+
+    // ---- khối toán $$ ... $$ nhiều dòng.
+    // Nếu không có nhánh này, các dòng bên trong bị gom thành đoạn văn và tách
+    // bằng <br>, nên "$$" đứng lẻ hoặc "\\frac{a}{b}" bị cắt đôi ra thành text
+    // rác. Gemini rất hay xuống dòng giữa hai dấu $$ khi công thức dài.
+    if (/^\s{0,3}\$\$\s*$/.test(line)) {
+      const buf = [];
+      i++;
+      while (i < lines.length && !/^\s{0,3}\$\$\s*$/.test(lines[i])) {
+        buf.push(lines[i]); i++;
+      }
+      if (i < lines.length) i++; // nuốt dấu $$ đóng
+      out.push(renderMath(buf.join("\n"), true));
+      continue;
+    }
+
+    // ---- đường kẻ ngang
+    if (/^\s{0,3}([-*_])\s*(\1\s*){2,}$/.test(line)) {
+      out.push("<hr>");
+      i++;
+      continue;
+    }
+
+    // ---- tiêu đề # .. ######
+    const head = line.match(/^\s{0,3}(#{1,6})\s+(.*)$/);
+    if (head) {
+      const lvl = head[1].length;
+      out.push("<h" + lvl + ">" + inlineMd(head[2].replace(/\s+#+\s*$/, "")) + "</h" + lvl + ">");
+      i++;
+      continue;
+    }
+
+    // ---- bảng: dòng tiêu đề có |, rồi tới dòng phân cách |---|
+    if (line.indexOf("|") !== -1 && i + 1 < lines.length &&
+        /^\s*\|?[\s:|-]*-[\s:|-]*\|?\s*$/.test(lines[i + 1]) && lines[i + 1].indexOf("-") !== -1) {
+      const cols = splitRow(line).length;
+      const aligns = splitRow(lines[i + 1]).map((c) => {
+        const s = c.trim();
+        if (/^:.*:$/.test(s)) return "center";
+        if (/:$/.test(s)) return "right";
+        if (/^:/.test(s)) return "left";
+        return "";
+      });
+      const styleOf = (n) => (aligns[n] ? ' style="text-align:' + aligns[n] + '"' : "");
+      i += 2;
+      out.push("<table><thead><tr>");
+      splitRow(line).forEach((c, n) => { out.push("<th" + styleOf(n) + ">" + inlineMd(c) + "</th>"); });
+      out.push("</tr></thead><tbody>");
+      while (i < lines.length && lines[i].indexOf("|") !== -1 && lines[i].trim() !== "") {
+        const cells = splitRow(lines[i]);
+        out.push("<tr>");
+        for (let n = 0; n < cols; n++) {
+          out.push("<td" + styleOf(n) + ">" + inlineMd(cells[n] || "") + "</td>");
+        }
+        out.push("</tr>");
+        i++;
+      }
+      out.push("</tbody></table>");
+      continue;
+    }
+
+    // ---- trích dẫn >
+    if (/^\s{0,3}>/.test(line)) {
+      const buf = [];
+      while (i < lines.length && /^\s{0,3}>/.test(lines[i])) {
+        buf.push(lines[i].replace(/^\s{0,3}>\s?/, ""));
+        i++;
+      }
+      out.push("<blockquote>" + renderMarkdown(buf.join("\n")) + "</blockquote>");
+      continue;
+    }
+
+    // ---- danh sách - * + hoặc 1.
+    const li = line.match(/^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/);
+    if (li) {
+      const ordered = /\d/.test(li[2]);
+      const items = [];
+      while (i < lines.length) {
+        const m = lines[i].match(/^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/);
+        if (!m) {
+          // Dòng thụt lề ngay sau gạch đầu dòng là phần tiếp của mục đó.
+          if (items.length && lines[i].trim() !== "" && /^\s{2,}\S/.test(lines[i])) {
+            items[items.length - 1][1] += "\n" + lines[i].trim();
+            i++;
+            continue;
+          }
+          break;
+        }
+        // Đổi từ "-" sang "1." trong cùng khối sẽ kết thúc khối cũ.
+        if (/\d/.test(m[2]) !== ordered) break;
+        items.push([m[1].replace(/\t/g, "  ").length, m[3]]);
+        i++;
+      }
+      out.push(renderList(items, ordered));
+      continue;
+    }
+
+    // ---- đoạn văn: gom tới dòng trống
+    if (line.trim() === "") { i++; continue; }
+    const para = [];
+    while (i < lines.length && lines[i].trim() !== "" &&
+           !/^\s{0,3}(#{1,6}\s|>|`{3,}|~{3,}|\$\$\s*$)/.test(lines[i]) &&
+           !/^(\s*)([-*+]|\d{1,9}[.)])\s+/.test(lines[i]) &&
+           !/^\s{0,3}([-*_])\s*(\1\s*){2,}$/.test(lines[i])) {
+      para.push(lines[i].trim());
+      i++;
+    }
+    if (para.length) {
+      // Xử lý TỪNG DÒNG rồi nối bằng <br>. CommonMark nghiêm có nghĩa gộp
+      // newline đơn thành khoảng trắng, nhưng Gemini hay viết mỗi dòng là một
+      // ý riêng ("Bước 1:...\nBước 2:..." không có gạch đầu dòng). Gộp lại sẽ
+      // dính thành một khối khó đọc và lệch với đúng những gì Gemini hiện ra.
+      // Tách từng dòng cũng an toàn hơn: code span/link không bao giờ chứa
+      // newline nên không có regex nào bị cắt đôi.
+      out.push("<p>" + para.map((l) => inlineMd(l)).join("<br>") + "</p>");
+    }
+    else i++;
+  }
+  return out.join("");
+}
 
 function addMsg(role, text, imgDataUrls) {
   const div = document.createElement("div");
@@ -80,11 +418,16 @@ function addMsg(role, text, imgDataUrls) {
     div.appendChild(im);
   });
   const p = document.createElement("div");
-  p.textContent = text || "";
+  p.className = "md";
   div.appendChild(p);
   $("messages").appendChild(div);
   $("messages").scrollTop = $("messages").scrollHeight;
-  return p;
+  const set = (t) => {
+    p.innerHTML = MD_ON ? renderMarkdown(t) : "";
+    if (!MD_ON) p.textContent = t || "";
+  };
+  set(text || "");
+  return set;
 }
 
 function buildHistory() {
@@ -125,6 +468,27 @@ $("file").addEventListener("change", () => {
 });
 
 $("attach").onclick = () => $("file").click();
+
+/* Bật/tắt markdown. Giữ `msgs` là nguồn sự thật nên khi đổi chế độ chỉ cần vẽ
+   lại, không phải nhờ server gửi lại. */
+function applyMdMode() {
+  $("messages").classList.toggle("raw", !MD_ON);
+  const btn = $("mdToggle");
+  btn.classList.toggle("on", MD_ON);
+  btn.title = MD_ON
+    ? "Đang hiện markdown đã định dạng. Bấm để xem nguyên văn Gemini trả về."
+    : "Đang hiện nguyên văn. Bấm để hiện markdown đã định dạnh.";
+  msgs.forEach((m, idx) => {
+    const holder = m._set;
+    if (holder) holder(m.text);
+  });
+}
+$("mdToggle").onclick = () => {
+  MD_ON = !MD_ON;
+  localStorage.setItem("gemini_md", MD_ON ? "1" : "0");
+  applyMdMode();
+};
+
 $("clear").onclick = () => {
   msgs.length = 0;
   attachments = [];
@@ -148,15 +512,26 @@ async function send() {
   $("input").value = "";
 
   const imgs = myAttach.map(([url]) => url);
-  addMsg("user", text, imgs);
-  msgs.push({ role: "user", text, images: imgs });
+  msgs.push({ role: "user", text, images: imgs, _set: addMsg("user", text, imgs) });
 
-  const aiP = addMsg("ai", "");
-  msgs.push({ role: "assistant", text: "" });
+  const aiSet = addMsg("ai", "");
+  msgs.push({ role: "assistant", text: "", _set: aiSet });
   const aiIdx = msgs.length - 1;
 
   const btn = $("send");
   btn.disabled = true;
+
+  // Stream có thể hàng trăm chunk; render lại toàn bộ markdown mỗi chunk thì
+  // rẻ hơn nhiều so với nối chuỗi vào DOM, nhưng vẫn gom theo frame để không
+  // dựng lại cây DOM 60 lần/giây.
+  let acc = "", raf = 0;
+  const flush = () => {
+    raf = 0;
+    aiSet(acc);
+    msgs[aiIdx].text = acc;
+    $("messages").scrollTop = $("messages").scrollHeight;
+  };
+  const schedule = () => { if (!raf) raf = requestAnimationFrame(flush); };
 
   const body = {
     model: $("model").value.trim() || null,
@@ -177,51 +552,54 @@ async function send() {
     if (!resp.ok) {
       let detail = "HTTP " + resp.status;
       try { const j = await resp.json(); detail = j.detail || j.error?.message || detail; } catch (e) {}
-      aiP.textContent = detail;
-      msgs[aiIdx].text = detail;
+      acc = "⚠️ " + detail;
+      aiSet(acc);
+      msgs[aiIdx].text = acc;
       return;
     }
 
-    const reader = resp.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    let done = false;
-    while (!done) {
-      const { value, done: d } = await reader.read();
-      done = d;
-      buf += decoder.decode(value || new Uint8Array(), { stream: !done });
-      const parts = buf.split("\n\n");
-      buf = parts.pop();
-      for (const p of parts) {
-        for (const line of p.split("\n")) {
-          if (!line.startsWith("data:")) continue;
-          const data = line.slice(5).trim();
-          if (data === "[DONE]") continue;
-          try {
-            const j = JSON.parse(data);
-            if (j.choices?.[0]?.delta?.content) {
-              aiP.textContent += j.choices[0].delta.content;
-              msgs[aiIdx].text += j.choices[0].delta.content;
-              $("messages").scrollTop = $("messages").scrollHeight;
-            }
-            if (j.error) { aiP.textContent = "Lỗi: " + j.error.message; }
-          } catch (e) {}
+const reader = resp.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+      let done = false;
+      while (!done) {
+        const { value, done: d } = await reader.read();
+        done = d;
+        buf += decoder.decode(value || new Uint8Array(), { stream: !done });
+        const parts = buf.split("\n\n");
+        buf = parts.pop();
+        for (const p of parts) {
+          for (const line of p.split("\n")) {
+            if (!line.startsWith("data:")) continue;
+            const data = line.slice(5).trim();
+            if (data === "[DONE]") continue;
+            try {
+              const j = JSON.parse(data);
+              if (j.choices?.[0]?.delta?.content) {
+                acc += j.choices[0].delta.content;
+                schedule();
+              }
+              if (j.error) acc += "\n\n> ⚠️ " + (j.error.message || "lỗi không rõ");
+            } catch (e) {}
+          }
         }
       }
+    } catch (e) {
+      acc += (acc ? "\n\n" : "") + "Lỗi kết nối: " + e.message;
+      msgs[aiIdx].text = acc;
+    } finally {
+      if (raf) cancelAnimationFrame(raf);
+      flush();
+      btn.disabled = false;
+      $("input").focus();
     }
-  } catch (e) {
-    aiP.textContent = "Lỗi kết nối: " + e.message;
-    msgs[aiIdx].text = "Lỗi kết nối: " + e.message;
-  } finally {
-    btn.disabled = false;
-    $("input").focus();
   }
-}
 
 $("send").onclick = send;
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
+applyMdMode();
 </script>
 </body>
 </html>

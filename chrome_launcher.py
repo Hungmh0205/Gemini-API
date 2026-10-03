@@ -59,6 +59,13 @@ DEFAULT_WORK_DIR = "chrome-profile"
 DEFAULT_AGENT_PROFILE = "Lumi-Agent"
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8000/health"
 
+# Giám hó Chrome: giới hạn số lần mở lại khi Chrome liên tục chết, và nghỉ dần
+# tăng giữa các lần để không khoét CPU. Quá ngưỡng thì supervisor thoát (server
+# vẫn chạy), thay vì mở Chrome mãi. Cùng triết lý tray.ServerProcess.should_restart.
+MAX_RELAUNCHES = 5
+RELAUNCH_WINDOW = 300.0
+RELAUNCH_BACKOFF = (15, 30, 60, 120, 300)
+
 _hwnd_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 GWL_EXSTYLE = -20
@@ -662,6 +669,30 @@ def hide_chrome_windows(pids) -> int:
     return hidden[0]
 
 
+def _pid_alive(pid: int) -> bool:
+    """Tiến trình còn sống không. Syscall thuần, không spawn tiến trình con.
+
+    `browser_pids()` phải chạy PowerShell `Get-CimInstance Win32_Process` (~0.5s),
+    nên dùng nó để poll trong vòng đợi là tốn ~25 lần spawn mỗi lần đóng Chrome.
+    """
+    SYNCHRONIZE = 0x00100000
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    STILL_ACTIVE = 259
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    h = k32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+    if not h:
+        return False
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            return False
+        return code.value == STILL_ACTIVE
+    finally:
+        k32.CloseHandle(h)
+
+
 def close_agent_chrome(user_data_dir: str, timeout: float = 25.0) -> bool:
     """Đóng Chrome agent mà không làm hỏng profile.
 
@@ -689,10 +720,16 @@ def close_agent_chrome(user_data_dir: str, timeout: float = 25.0) -> bool:
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not browser_pids(user_data_dir):
-            log.info("Chrome agent đã đóng sạch.")
-            return True
-        time.sleep(0.5)
+        if not any(_pid_alive(pid) for pid in pids):
+            # Các pid đã báo tắt. Chrome có thể đổi pid lúc thoát, nên quét lại
+            # `browser_pids()` một lần cho chắc — nhưng chỉ một lần, thay vì mỗi
+            # vòng lặp.
+            left = browser_pids(user_data_dir)
+            if not left:
+                log.info("Chrome agent đã đóng sạch.")
+                return True
+            pids = left
+        time.sleep(1.5)
 
     left = browser_pids(user_data_dir)
     log.warning(
@@ -1038,6 +1075,11 @@ async def browser_supervisor(browser_cfg: dict) -> None:
     warned_no_ext = False
     waited_sync = False
     target: ChromeProfile | None = None
+    # Chrome có thể chết ngay sau khi mở (profile bị khoá, Chrome tự cập nhật).
+    # Không giới hạn thì vòng lặp này mở lại mỗi 15s vô tận, mỗi lần đều spawn
+    # tiến trình Chrome. Cùng triết lý với `tray.ServerProcess.should_restart`.
+    launch_attempts: list[float] = []
+    alive_since: float = 0.0
 
     while True:
         if target is None:
@@ -1074,13 +1116,45 @@ async def browser_supervisor(browser_cfg: dict) -> None:
             target = None
             continue
 
-        if not chrome_instance_alive(target.user_data_dir):
-            launch_profile(
-                target.user_data_dir, chrome_path, mode, url, ext_dir, target.name
-            )
+        # `chrome_instance_alive` -> `browser_pids` -> `_chrome_processes` spawn
+        # PowerShell `Get-CimInstance Win32_Process` (timeout 15s). Gọi trực tiếp ở
+        # đây thì chặn event loop mỗi vòng lặp, và vòng lặp chạy mỗi ~15s: `/health`
+        # trễ >2s khiến tray tưởng server đã chết rồi spawn thêm server tranh cổng.
+        if not await asyncio.to_thread(chrome_instance_alive, target.user_data_dir):
+            if alive_since:
+                # Chrome sống được một lúc rồi lại chết thì đếm lại từ đầu.
+                alive_since = 0.0
+                launch_attempts.clear()
+            now = time.monotonic()
+            launch_attempts = [t for t in launch_attempts if now - t < RELAUNCH_WINDOW]
+            if len(launch_attempts) >= MAX_RELAUNCHES:
+                log.error(
+                    "Chrome agent đã chết %d lần trong %.0fs — bỏ giám hó để khỏi mở "
+                    "lại vô tận. Server vẫn phục vụ /v1 nếu phiên còn sống. "
+                    "Thử `python chrome_launcher.py --doctor`, hoặc --reset nếu profile kẹt.",
+                    len(launch_attempts), RELAUNCH_WINDOW,
+                )
+                return
+            backoff = RELAUNCH_BACKOFF[min(len(launch_attempts), len(RELAUNCH_BACKOFF) - 1)]
+            launch_attempts.append(now)
+            if backoff > RELAUNCH_BACKOFF[0]:
+                log.warning("Chrome agent lại chết; chờ %.0fs trước khi mở lại.", backoff)
+                if not _keep_alive(keep_alive):
+                    return
+                await asyncio.sleep(backoff)
+            try:
+                launch_profile(
+                    target.user_data_dir, chrome_path, mode, url, ext_dir, target.name
+                )
+            except Exception as e:  # noqa: BLE001 - supervisor phải sống sót lần lặp sau
+                log.warning("Không khởi động được Chrome agent: %s", e)
             if health_url and not waited_sync:
-                waited_sync = True
-                await wait_for_auth(health_url, sync_timeout)
+                # Chỉ đánh dấu đã chờ khi chờ thành công: `wait_for_auth` hết giờ thì
+                # vòng sau còn cơ hội thử lại, thay vì bỏ luôn.
+                if await wait_for_auth(health_url, sync_timeout):
+                    waited_sync = True
+        elif not alive_since:
+            alive_since = time.monotonic()
 
         if _keep_alive(keep_alive):
             await asyncio.sleep(15)
@@ -1222,7 +1296,7 @@ def reset(cfg: dict) -> int:
     print()
     print("Đã reset. Bước tiếp theo:")
     print("  1) python chrome_launcher.py --setup   (load unpacked + đăng nhập Google tài khoản mới)")
-    print("  2) run_server.bat")
+    print("  2) run_server-debug.bat")
     return 0
 
 
