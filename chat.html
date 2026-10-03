@@ -30,6 +30,19 @@
   .thumb { position:relative; }
   .thumb img { width:56px; height:56px; object-fit:cover; border-radius:8px; border:1px solid #2a3242; }
   .thumb button { position:absolute; top:-6px; right:-6px; width:18px; height:18px; border:none; border-radius:50%; background:#e5484d; color:#fff; cursor:pointer; font-size:11px; line-height:18px; }
+  .filetag { display:inline-flex; align-items:center; gap:6px; max-width:260px; padding:6px 10px; background:#161b24; border:1px solid #2a3242; border-radius:8px; font-size:12px; }
+  .filetag span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; max-width:170px; }
+  .filetag small { color:var(--muted); font-size:10px; }
+  .media { display:flex; flex-direction:column; gap:10px; margin-top:10px; }
+  .media figure { margin:0; display:flex; flex-direction:column; gap:6px; align-items:flex-start; }
+  .media img { max-width:min(100%,420px); border-radius:10px; border:1px solid #2a3242; }
+  .media video { max-width:min(100%,480px); border-radius:10px; }
+  .media audio { width:min(100%,420px); }
+  .media button.dl { background:#1c2330; border:1px solid #2a3242; color:var(--text); border-radius:8px; padding:5px 10px; font-size:12px; }
+  .loading { color:var(--muted); font-size:12px; }
+  .cblk { position:relative; }
+  .cblk .dlcode { position:absolute; top:6px; right:6px; z-index:2; background:#1c2330; border:1px solid #2a3242; color:var(--text); border-radius:6px; padding:3px 8px; font-size:11px; opacity:.85; }
+  .cblk .dlcode:hover { opacity:1; }
   button { cursor:pointer; }
   #send, #attach { background:var(--accent); border:none; color:#fff; padding:10px 16px; border-radius:10px; font-size:14px; }
   #attach { background:#2a3242; }
@@ -91,16 +104,16 @@
   <button id="clear" style="background:#2a3242;border:none;color:#fff;padding:6px 12px;border-radius:8px">Reset</button>
 </header>
 
-<div id="messages"><div class="hint">Gõ tin nhắn bên dưới để test API. Bấm nút &#128206; để đính kèm ảnh.</div></div>
+<div id="messages"><div class="hint">Gõ tin nhắn bên dưới để test API. Bấm nút &#128206; để đính kèm file (ảnh, tài liệu, code, zip...).</div></div>
 
 <div id="composer">
   <div id="attachments"></div>
   <textarea id="input" placeholder="Nhập tin nhắn..."></textarea>
-  <button id="attach" title="Đính kèm ảnh">&#128206;</button>
+  <button id="attach" title="Đính kèm file (ảnh, tài liệu, code, zip)">&#128206;</button>
   <button id="send">Gửi</button>
 </div>
 
-<input type="file" id="file" accept="image/*" multiple hidden>
+<input type="file" id="file" multiple hidden>
 
 <!-- KaTeX phải nạp TRƯỚC script chính: renderer bên dưới gọi katex.render(). -->
 <script src="/vendor/katex/katex.min.js"></script>
@@ -269,7 +282,19 @@ function renderMarkdown(src) {
   while (i < lines.length) {
     const line = lines[i];
 
-    // ---- khối code ``` ... ```
+    /* Đuôi file theo ngôn ngữ trong info string của khối code, để nút tải đặt đúng
+   tên thay vì luôn `.txt`. */
+const EXT_BY_LANG = {
+  python: ".py", py: ".py", javascript: ".js", js: ".js", typescript: ".ts",
+  ts: ".ts", java: ".java", c: ".c", cpp: ".cpp", "c++": ".cpp", csharp: ".cs",
+  cs: ".cs", go: ".go", rust: ".rs", ruby: ".rb", php: ".php", swift: ".swift",
+  kotlin: ".kt", sql: ".sql", bash: ".sh", sh: ".sh", shell: ".sh", json: ".json",
+  yaml: ".yaml", yml: ".yml", toml: ".toml", html: ".html", css: ".css",
+  xml: ".xml", markdown: ".md", md: ".md", csv: ".csv", r: ".r", lua: ".lua",
+  perl: ".pl", scala: ".scala", dart: ".dart", zig: ".zig",
+};
+
+// ---- khối code ``` ... ```
     const fence = line.match(/^\s{0,3}(`{3,}|~{3,})\s*([\w+#.-]*)\s*$/);
     if (fence) {
       const mark = fence[1][0], minLen = fence[1].length, lang = fence[2];
@@ -280,8 +305,18 @@ function renderMarkdown(src) {
         if (close && close[1][0] === mark && close[1].length >= minLen) { i++; break; }
         buf.push(lines[i]); i++;
       }
-      out.push('<pre class="md-pre"' + (lang ? ' data-lang="' + esc(lang) + '"' : "") +
-               "><code>" + esc(buf.join("\n")) + "</code></pre>");
+      /* Bọc thêm lớp `<div class="cblk">` + nút tải: Gemini không tạo được file .py/.xlsx
+       để tải (đã kiểm chứng: chỉ trả code block), nên tải khối code là cách duy
+       nhất để lấy được nội dung dạng file thật. Nội dung code đã escape ở trên,
+       không đưa vào data-attribute để tránh phải escape hai lần. */
+      out.push(
+        '<div class="cblk">' +
+        '<button class="dlcode" type="button">⬇ tải ' +
+        esc((lang || "code") + (EXT_BY_LANG[lang.toLowerCase()] || ".txt")) +
+        "</button>" +
+        '<pre class="md-pre"' + (lang ? ' data-lang="' + esc(lang) + '"' : "") +
+        "><code>" + esc(buf.join("\n")) + "</code></pre></div>"
+      );
       continue;
     }
 
@@ -405,7 +440,50 @@ function renderMarkdown(src) {
   return out.join("");
 }
 
-function addMsg(role, text, imgDataUrls) {
+/* Blob URL đã tạo, để revoke khi tin nhắn bị xoá hoặc hội thoại được reset.
+   Không revoke ngay sau khi tạo: ảnh chưa tải xong sẽ vỡ. */
+const blobURLs = new Set();
+
+function revokeAllBlobs() {
+  for (const u of blobURLs) {
+    try { URL.revokeObjectURL(u); } catch (e) {}
+  }
+  blobURLs.clear();
+}
+
+/* Tải media qua `fetch` + blob URL thay vì đưa thẳng `/v1/files/<id>` vào
+   `src`. Lý do: endpoint đó bắt buộc API key, mà thẻ `<img src>` không gửi
+   được header — nên nếu dùng URL trực tiếp thì ảnh sẽ 401. Đổi lại phải chịu
+   mất range request cho video/audio (blob phải tải hết mới phát). */
+async function resolveFile(url, key) {
+  try {
+    const r = await fetch(url, { headers: { Authorization: "Bearer " + key } });
+    if (!r.ok) return null;
+    const b = URL.createObjectURL(await r.blob());
+    blobURLs.add(b);
+    return b;
+  } catch (e) {
+    return null;
+  }
+}
+
+function fileChip(name, mime) {
+  const c = document.createElement("div");
+  c.className = "filetag";
+  const ic = document.createElement("strong");
+  ic.textContent = "📎";
+  const nm = document.createElement("span");
+  nm.textContent = name;           // textContent, không innerHTML
+  c.append(ic, nm);
+  if (mime) {
+    const m = document.createElement("small");
+    m.textContent = mime;
+    c.appendChild(m);
+  }
+  return c;
+}
+
+function addMsg(role, text, imgDataUrls, fileDocs) {
   const div = document.createElement("div");
   div.className = "msg " + (role === "user" ? "user" : role === "error" ? "error" : "ai");
   const r = document.createElement("b");
@@ -417,49 +495,209 @@ function addMsg(role, text, imgDataUrls) {
     im.src = url;
     div.appendChild(im);
   });
+  (fileDocs || []).forEach(([b64, name]) => {
+    /* Chỉ hiện tên, không render nội dung: file tài liệu không xem trực tiếp
+       được trong chat, và nhúng base64 thô vào DOM chỉ tốn RAM. */
+    void b64;
+    div.appendChild(fileChip(name, ""));
+  });
   const p = document.createElement("div");
   p.className = "md";
   div.appendChild(p);
   $("messages").appendChild(div);
   $("messages").scrollTop = $("messages").scrollHeight;
+
+  /* Media Gemini trả về vẽ vào khối riêng, không đụng phần text để streaming
+     không bị xoá mỗi chunk. */
+  const media = document.createElement("div");
+  media.className = "media";
+  div.appendChild(media);
+
   const set = (t) => {
     p.innerHTML = MD_ON ? renderMarkdown(t) : "";
     if (!MD_ON) p.textContent = t || "";
   };
   set(text || "");
+
+  set.setMedia = (list) => {
+    media.innerHTML = "";
+    (list || []).forEach((a) => {
+      const holder = document.createElement("figure");
+      if (a.kind === "video") {
+        const v = document.createElement("video");
+        v.controls = true;
+        v.dataset.fileUrl = a.url;
+        holder.appendChild(v);
+      } else if (a.kind === "audio") {
+        const v = document.createElement("audio");
+        v.controls = true;
+        v.dataset.fileUrl = a.url;
+        holder.appendChild(v);
+      } else {
+        const im = document.createElement("img");
+        im.dataset.fileUrl = a.url;
+        im.alt = a.alt || a.title || "";
+        holder.appendChild(im);
+      }
+      const btn = document.createElement("button");
+      btn.className = "dl";
+      btn.textContent = "⬇ " + (a.filename || a.title || "tải về");
+      btn.dataset.fileUrl = a.url;
+      btn.dataset.fileName = a.filename || "file";
+      holder.appendChild(btn);
+      media.appendChild(holder);
+    });
+  };
   return set;
 }
 
+/* Nạp blob cho mọi phần tử media vừa vẽ, có placeholder trong lúc chờ. */
+async function hydrateMedia(root, key) {
+  const nodes = root.querySelectorAll("img[data-file-url], video[data-file-url], audio[data-file-url]");
+  await Promise.all(
+    Array.from(nodes).map(async (n) => {
+      const holder = document.createElement("span");
+      holder.className = "loading";
+      holder.textContent = "đang tải…";
+      n.style.display = "none";
+      n.parentNode.insertBefore(holder, n);
+      const u = await resolveFile(n.dataset.fileUrl, key);
+      if (u) {
+        n.src = u;
+        n.style.display = "";
+        holder.remove();
+      } else {
+        holder.textContent = "không tải được (401/404)";
+        n.remove();
+      }
+    })
+  );
+}
+
+/* Nút tải: `<a download>` cũng không gửi được header nên phải fetch rồi mới
+   kích hoạt download. Fetch lazy — chỉ khi bấm. */
+async function downloadFile(url, name, key) {
+  const u = await resolveFile(url, key);
+  if (!u) {
+    alert("Không tải được file (401 hoặc hết hạn cache).");
+    return;
+  }
+  const a = document.createElement("a");
+  a.href = u;
+  a.download = name || "file";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+$("messages").addEventListener("click", (e) => {
+  const b = e.target.closest("button.dl[data-file-url]");
+  if (b) {
+    downloadFile(b.dataset.fileUrl, b.dataset.fileName, $("apiKey").value.trim());
+    return;
+  }
+  /* Nút tải khối code: đọc textContent của <code> ngay cạnh nút. Dùng Blob
+     thuần client nên không cần qua server. */
+  const cb = e.target.closest(".dlcode");
+  if (cb) {
+    const pre = cb.parentElement.querySelector("pre code");
+    if (!pre) return;
+    const label = cb.textContent.replace("⬇ tải ", "").trim();
+    const url = URL.createObjectURL(
+      new Blob([pre.textContent], { type: "text/plain;charset=utf-8" })
+    );
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = label || "code.txt";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+});
+
+/* Dựng lịch sử cho request. File đính kèm giờ đi theo đúng loại: ảnh qua
+   `image_url` (giữ tương thích vision), file tài liệu qua `file_data` kèm
+   `filename` — không có tên thì server tạo tên ngẫu nhiên và Gemini không đọc
+   được nội dung. */
 function buildHistory() {
   return msgs.map((m) => ({
     role: m.role,
     content: [
       { type: "text", text: m.text },
       ...(m.images || []).map((url) => ({ type: "image_url", image_url: { url } })),
+      ...(m.files || []).map(([b64, name]) => ({
+        type: "file",
+        file_data: b64,
+        filename: name,
+      })),
     ],
   }));
 }
 
+/* File đính kèm đang chờ gửi: `[dataUrl, ten, laAnh]`. Ảnh giữ data-URL để hiện
+   thumbnail được; file khác gửi base64 thô qua `file_data` + `filename` để
+   server giữ được đúng tên khi upload lên Gemini. */
+function isImageName(name) {
+  return /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(name || "");
+}
+
+function humanSize(bytes) {
+  if (bytes < 1024) return bytes + " B";
+  if (bytes < 1048576) return (bytes / 1024).toFixed(0) + " KB";
+  return (bytes / 1048576).toFixed(1) + " MB";
+}
+
 function renderThumbs() {
   $("attachments").innerHTML = "";
-  attachments.forEach(([url, name], i) => {
+  attachments.forEach(([url, name, isImg], i) => {
     const w = document.createElement("div");
     w.className = "thumb";
-    const im = document.createElement("img");
-    im.src = url;
+    if (isImg) {
+      const im = document.createElement("img");
+      im.src = url;
+      im.alt = name;
+      w.appendChild(im);
+    } else {
+      /* Tên file đến từ máy người dùng nên phải set bằng textContent, không nối
+         vào innerHTML — nếu không thì tên kiểu `<img onerror=...>` thành XSS. */
+      const f = document.createElement("div");
+      f.className = "filetag";
+      const ic = document.createElement("strong");
+      ic.textContent = "📎";
+      const nm = document.createElement("span");
+      nm.textContent = name;
+      const sz = document.createElement("small");
+      sz.textContent = humanSize(Math.floor((url.length * 3) / 4));
+      f.append(ic, nm, sz);
+      w.appendChild(f);
+    }
     const x = document.createElement("button");
     x.textContent = "×";
+    x.title = "Bỏ file này";
     x.onclick = () => { attachments.splice(i, 1); renderThumbs(); };
-    w.append(im, x);
+    w.appendChild(x);
     $("attachments").appendChild(w);
   });
 }
 
+const MAX_LOCAL_FILE = 20 * 1024 * 1024;
+
 $("file").addEventListener("change", () => {
   for (const f of $("file").files) {
+    if (f.size > MAX_LOCAL_FILE) {
+      alert(`${f.name} quá lớn (${humanSize(f.size)}). Tối đa ${humanSize(MAX_LOCAL_FILE)}.`);
+      continue;
+    }
+    const isImg = isImageName(f.name);
     const reader = new FileReader();
+    /* Ảnh giữ data-URL để hiện thumbnail; file khác tách phần base64 thô ra để
+       `filename` đi kèm — server cần tên đúng thì Gemini mới đọc được file. */
     reader.onload = () => {
-      attachments.push([reader.result, f.name]);
+      const result = String(reader.result || "");
+      attachments.push(
+        isImg ? [result, f.name, true] : [result.slice(result.indexOf(",") + 1), f.name, false]
+      );
       renderThumbs();
     };
     reader.readAsDataURL(f);
@@ -493,6 +731,7 @@ $("clear").onclick = () => {
   msgs.length = 0;
   attachments = [];
   renderThumbs();
+  revokeAllBlobs();
   $("messages").innerHTML = "";
   const h = document.createElement("div");
   h.className = "hint";
@@ -511,8 +750,15 @@ async function send() {
   renderThumbs();
   $("input").value = "";
 
-  const imgs = myAttach.map(([url]) => url);
-  msgs.push({ role: "user", text, images: imgs, _set: addMsg("user", text, imgs) });
+  const imgs = myAttach.filter((a) => a[2]).map((a) => a[0]);
+  const docs = myAttach.filter((a) => !a[2]).map((a) => [a[0], a[1]]);
+  msgs.push({
+    role: "user",
+    text,
+    images: imgs,
+    files: docs,
+    _set: addMsg("user", text, imgs, docs),
+  });
 
   const aiSet = addMsg("ai", "");
   msgs.push({ role: "assistant", text: "", _set: aiSet });
@@ -562,6 +808,7 @@ const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buf = "";
       let done = false;
+      let gotMedia = false;
       while (!done) {
         const { value, done: d } = await reader.read();
         done = d;
@@ -578,6 +825,17 @@ const reader = resp.body.getReader();
               if (j.choices?.[0]?.delta?.content) {
                 acc += j.choices[0].delta.content;
                 schedule();
+              }
+              /* Media về ở chunk cuối nên vẽ khi stream đã xong, tránh phải dựng
+                 lại media mỗi lần text đổi. */
+              const att = j.choices?.[0]?.delta?.attachments;
+              if (att && att.length && !gotMedia) {
+                gotMedia = true;
+                msgs[aiIdx].attachments = att;
+                aiSet.setMedia(att);
+                hydrateMedia($("messages").lastElementChild, key).then(() => {
+                  $("messages").scrollTop = $("messages").scrollHeight;
+                });
               }
               if (j.error) acc += "\n\n> ⚠️ " + (j.error.message || "lỗi không rõ");
             } catch (e) {}
@@ -599,6 +857,7 @@ $("send").onclick = send;
 $("input").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
 });
+window.addEventListener("beforeunload", revokeAllBlobs);
 applyMdMode();
 </script>
 </body>

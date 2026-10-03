@@ -45,7 +45,9 @@ CARD_CONTENT_RE = re.compile(r"^https?://googleusercontent\.com/card_content/\d+
 # Placeholder links Gemini leaves in reply text where a rendered attachment belongs. The
 # path can carry several segments - a web image search returns
 # `image_collection/image_retrieval/<id>` - which a single-segment pattern left behind.
-ARTIFACTS_RE = re.compile(r"https?://googleusercontent\.com/(?:\w+/)+\d+\n*")
+# The final segment may contain underscores and trailing digits (e.g. `…/123456_711`),
+# so we match any word-chars run rather than bare `\d+` to avoid leaving `_711` debris.
+ARTIFACTS_RE = re.compile(r"https?://googleusercontent\.com/(?:\w+/)+\w+\n*")
 MODEL_PREFIX_RE = re.compile(r"^gemini-(?:\d+(?:\.\d+)?-)?")
 DEFAULT_METADATA = ["", "", "", None, None, None, None, None, None, ""]
 
