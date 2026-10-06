@@ -2,6 +2,7 @@
 
 from .candidate import Candidate
 from .citation import Citation
+from .file import GeneratedFile
 from .gem import Gem, GemJar
 from .grpc import RPCData
 from .image import Image, WebImage, GeneratedImage

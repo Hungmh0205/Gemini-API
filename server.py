@@ -24,13 +24,13 @@ Environment variables:
 import argparse
 import asyncio
 import base64
+import hashlib
 import hmac
 import json
 import logging
 import mimetypes
 import os
 import random
-import hashlib
 import re
 import secrets
 import shutil
@@ -58,7 +58,6 @@ from gemini_webapi import GeminiClient, set_log_level
 from gemini_webapi.constants import BROWSER_TYPE, AccountStatus
 from gemini_webapi.exceptions import AuthError, TemporarilyBlockedError, UsageLimitExceededError
 from gemini_webapi.types.image import GeneratedImage
-from gemini_webapi.types.video import GeneratedMedia, GeneratedVideo
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)-8s | %(message)s")
 set_log_level("WARNING")
@@ -70,7 +69,10 @@ BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
+import admin_api
 import chrome_launcher
+import config_store
+import logstore
 from chrome_launcher import (
     browser_supervisor,
     close_agent_chrome,
@@ -78,10 +80,6 @@ from chrome_launcher import (
     resolve_agent_profile,
     user_data_root,
 )
-
-import admin_api
-import config_store
-import logstore
 
 # Qua config_store để LUMI_CONFIG có tác dụng. Trước đây file này tự chỉ định
 # BASE_DIR/"config.json", nên LUMI_CONFIG bị bỏ qua: instance test lấn sang config
@@ -1138,6 +1136,48 @@ def _safe_filename(name: str | None, fallback_ext: str) -> str:
 
 
 _IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp")
+
+# Đuôi tài liệu/dữ liệu mà code execution của Gemini có thể sinh. Cần riêng vì
+# `_is_img_name` và `_content_type_ext` phân biệt "ảnh nặng 10MB" với "file nặng
+# 20MB", và một `.xlsx` phải đi theo nhánh tài liệu chứ không phải nhánh media.
+_DOCUMENT_EXTS = (
+    ".xlsx", ".xls", ".csv", ".tsv",
+    ".docx", ".doc", ".pptx", ".odt", ".ods",
+    ".pdf", ".rtf", ".tex", ".md", ".txt", ".json", ".xml", ".html", ".htm",
+    ".py", ".js", ".ts", ".java", ".c", ".cpp", ".cs", ".go", ".rs", ".rb",
+    ".php", ".sh", ".sql", ".yaml", ".yml", ".toml", ".ipynb",
+    ".zip", ".gz", ".tar", ".epub",
+)
+# `mimetypes` không biết mấy loại này; ánh xạ tay để phục vụ đúng kiểu.
+# `.csv` phải ghim thủ công: trên Windows `mimetypes` đọc registry, và registry
+# ánh xạ `.csv` sang `application/ms-excel`, khiến client tải file CSV về mở bằng
+# Excel kiểu cũ thay vì đọc được dạng văn bản.
+_EXTRA_MIME = {
+    ".rtf": "application/rtf",
+    ".tex": "application/x-tex",
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".toml": "application/toml",
+    ".ipynb": "application/x-ipynb+json",
+    ".epub": "application/epub+zip",
+    ".heic": "image/heic",
+    ".avif": "image/avif",
+}
+_MIME_BY_EXT = {ext: mime for ext, mime in _EXTRA_MIME.items()}
+# Kiểu tuyệt đối không được phục vụ inline: nội dung không phải media, chỉ tải về.
+_RASTER_EXTS = (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".heic", ".avif")
+
+
+def _mime_for_ext(ext: str, fallback: str = "application/octet-stream") -> str:
+    """MIME theo đuôi file, ưu tiên bảng tra riêng rồi mới tới `mimetypes`."""
+    ext = (ext or "").lower()
+    if not ext:
+        return fallback
+    if ext in _MIME_BY_EXT:
+        return _MIME_BY_EXT[ext]
+    return mimetypes.guess_type(f"x{ext}")[0] or fallback
 _TMP_DIR_PREFIX = "lumi_agent_"
 _TMP_DIR: Path | None = None
 
@@ -1330,13 +1370,22 @@ async def _resolve_output_url(img: "GeneratedImage") -> str:
 
 
 async def _store_output(
-    url: str, title: str, alt: str = "", expected_kind: str = "image"
+    url: str,
+    title: str,
+    alt: str = "",
+    expected_kind: str = "image",
+    filename: str = "",
+    declared_mime: str = "",
 ) -> dict | None:
     """Tải media về cache và trả metadata, hoặc None nếu hỏng.
 
     `None` khi tải lỗi là chấp nhận được: mất một media còn hơn làm hỏng cả câu
     trả lời cho client. Đây là phần *đẹp nhất* của output, lỗi ở đây chỉ được
     phép làm mất media.
+
+    `filename` là tên Gemini tự khai (`sandbox:/mnt/data/report.xlsx`) vì URL tải
+    của nó không chứa đuôi file. Không có nó thì tên lưu chỉ là `file.bin`, tải
+    về máy không mở được.
     """
     if not url:
         return None
@@ -1366,7 +1415,13 @@ async def _store_output(
             data = resp.content
             # Nếu content-type header sai (vd text/plain) nhưng data là binary
             # media thật → sniff magic bytes để cứu, không reject ngay.
-            if not (ctype.startswith(("image/", "video/", "audio/")) or ctype == "application/octet-stream"):
+            if not (
+                ctype.startswith(("image/", "video/", "audio/"))
+                or ctype in ("application/octet-stream", "binary/octet-stream")
+                or ctype.startswith("text/")
+                or _mime_for_ext(Path(filename).suffix.lower(), "") == ctype
+                or expected_kind == "document"
+            ):
                 sniffed = _sniff_ext(data) if data else ".bin"
                 if sniffed in (".jpg", ".png", ".gif", ".webp"):
                     ctype = {".jpg": "image/jpeg", ".png": "image/png",
@@ -1391,24 +1446,38 @@ async def _store_output(
         logging.warning("Không tải được %s '%s': %s", expected_kind, title[:40], e)
         return None
 
-    if ctype.startswith("image/"):
-        ext = mimetypes.guess_extension(ctype) or ".png"
+    # Đuôi từ tên Gemini khai ra là tín hiệu đáng tin nhất: URL tải không có đuôi
+    # và `content-type` thường là `application/octet-stream` cho mọi tài liệu.
+    name_ext = Path(filename).suffix.lower() if filename else ""
+    if name_ext:
+        ext, ctype = name_ext, _mime_for_ext(name_ext, declared_mime or ctype)
+    elif ctype.startswith("image/"):
+        ext = _content_type_ext(ctype) or ".png"
     elif ctype.startswith("video/"):
         ext = mimetypes.guess_extension(ctype) or ".mp4"
     elif ctype.startswith("audio/"):
         ext = mimetypes.guess_extension(ctype) or ".mp3"
+    elif ctype == "text/csv":
+        ext = ".csv"
+    elif ctype == "application/pdf":
+        ext = ".pdf"
     else:
-        if expected_kind == "video":
-            ctype = "video/mp4"
-            ext = ".mp4"
-        elif expected_kind == "audio":
-            ctype = "audio/mpeg"
-            ext = ".mp3"
+        # Không có tên lẫn kiểu cụ thể: đoán theo magic bytes rồi mới đoán theo tên.
+        ext = _sniff_ext(data) if data else ".bin"
+        if ext == ".bin":
+            if expected_kind == "video":
+                ctype, ext = "video/mp4", ".mp4"
+            elif expected_kind == "audio":
+                ctype, ext = "audio/mpeg", ".mp3"
+            elif expected_kind == "document":
+                # Không đoán được thì giữ kiểu gốc; tải về vẫn dùng được.
+                ctype, ext = (declared_mime or ctype or "application/octet-stream"), ".bin"
+            else:
+                ctype, ext = "image/png", ".png"
         else:
-            ctype = "image/png"
-            ext = ".png"
+            ctype = _mime_for_ext(ext, ctype)
 
-    name = _safe_filename(title, ext)
+    name = _safe_filename(filename or title, ext)
     try:
         OUTPUT_CACHE.mkdir(parents=True, exist_ok=True)
         blob.write_bytes(data)
@@ -1430,6 +1499,331 @@ async def _store_output(
 
     _prune_output_cache()
     return meta
+
+
+def _store_upload(
+    key: str,
+    data: bytes,
+    title: str,
+    filename: str = "",
+    declared_mime: str = "",
+    cid: str = "",
+) -> dict | None:
+    """Ghi bytes do extension đẩy lên vào cache và trả metadata.
+
+    File Gemini tạo ra không nằm trong candidate nên server **không tự tải được**:
+    `StreamGenerateContent` chỉ để lại `[file-tag: ...]` trong text. Bytes thật nằm
+    sau một URL `contribution.usercontent.google.com/download?c=...` mà chỉ web UI mở
+    được, và URL đó trả 403 nếu tải từ server (thiếu phiên trình duyệt). Nên
+    extension tải giúp rồi đẩy bytes lên đây.
+
+    `cid` là conversation id thật của Gemini. Nhờ nó, một response đang chờ file
+    biết file nào là của mình (`_await_file_upload`) thay vì mò theo tên.
+
+    `key` là khoá ổn định do extension sinh (hội thoại + chỉ số file). Nhờ vậy gửi
+    lại cùng một file hai lần vẫn trả cùng `file_id`, client không nhận trùng.
+    """
+    if not data:
+        return None
+    if len(data) > MAX_OUTPUT_FILE_BYTES:
+        logging.warning(
+            "File upload quá lớn (%.1fMB > %dMB), bỏ qua",
+            len(data) / 1e6,
+            MAX_OUTPUT_FILE_BYTES // (1024 * 1024),
+        )
+        return None
+
+    fid = _file_id(f"upload:{key}")
+    blob, meta_path = _cache_paths(fid)
+    if blob.exists() and meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta["cached"] = True
+            meta["url"] = f"/v1/files/{fid}"
+            if cid:
+                meta["cid"] = cid
+            return meta
+        except (OSError, ValueError):
+            logging.warning("Cache upload hỏng, ghi lại: %s", fid[:12])
+
+    # Đuôi file do extension khai là tín hiệu đáng tin nhất: `ESY5D` trả về
+    # `application/octet-stream` cho mọi tài liệu, không phân biệt được.
+    name_ext = Path(filename).suffix.lower() if filename else ""
+    if name_ext:
+        ext = name_ext
+        ctype = _mime_for_ext(ext, declared_mime or "")
+    else:
+        ext = _sniff_ext(data)
+        ctype = _mime_for_ext(ext, declared_mime or "") if ext != ".bin" else (
+            declared_mime or "application/octet-stream"
+        )
+
+    name = _safe_filename(filename or title, ext)
+    try:
+        OUTPUT_CACHE.mkdir(parents=True, exist_ok=True)
+        blob.write_bytes(data)
+        meta = {
+            "id": fid,
+            "url": f"/v1/files/{fid}",
+            "title": title,
+            "alt": title,
+            "mime_type": ctype,
+            "filename": name,
+            "size": len(data),
+            "created": int(time.time()),
+            "cached": True,
+        }
+        if cid:
+            meta["cid"] = cid
+        meta_path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        logging.warning("Không ghi được file upload: %s", e)
+        return None
+
+    _prune_output_cache()
+    return meta
+
+
+# Conversation nào đang chờ file từ trình duyệt. Key là Gemini conversation id
+# thật (`ModelOutput.metadata[0]`); value là dict `{"event", "meta"}` — event báo
+# "file của cid này đã tới", meta là metadata file vừa nhận.
+#
+# Vì sao cần: server tự tạo conversation và sinh câu trả lời, nhưng file Gemini
+# ---------------------------------------------------------------------------
+# Sinh câu trả lời qua trình duyệt.
+#
+# Đo thực tế: `generate_content` của gemini_webapi KHÔNG tạo file. Cùng một câu
+# hỏi "tạo file excel ..." trả về đúng 7 giây, HTTP 200, nhưng chỉ cho mã Python
+# kèm gợi ý <FollowUp> — không có bytes, không có marker. File chỉ tồn tại khi
+# Gemini chạy trong web UI (nơi nó chạy code trong sandbox rồi xuất ra Drive).
+#
+# Nên muốn có file thật thì phần sinh câu trả lời cũng phải chạy ở web UI:
+#   client -> server tạo job -> extension gõ prompt vào Gemini -> Gemini tạo file
+#   -> extension bấm Tải xuống, đẩy bytes lên /v1/files/upload -> extension báo
+#   text + danh sách file -> server mở khoá response cho client.
+#
+# Job được đẩy qua HTTP vì service worker của extension không giữ kết nối.
+# ---------------------------------------------------------------------------
+_CHAT_JOBS: dict[str, dict] = {}
+
+# Extension cần thời gian mở tab, gõ prompt, chờ Gemini sinh (có thể vài chục
+# giây với tác vụ tạo file) rồi tải file. Cho dư.
+CHAT_JOB_TIMEOUT = 300.0
+
+
+def _new_chat_job(prompt: str, model: str, cid: str | None = None) -> str:
+    job_id = secrets.token_urlsafe(12)
+    _CHAT_JOBS[job_id] = {
+        "event": asyncio.Event(),
+        "prompt": prompt,
+        "model": model,
+        "cid": cid,
+        "result": None,
+        "error": None,
+        "started": time.time(),
+    }
+    return job_id
+
+
+def _drop_chat_job(job_id: str) -> None:
+    _CHAT_JOBS.pop(job_id, None)
+
+
+async def _await_chat_job(job: dict, timeout: float = CHAT_JOB_TIMEOUT) -> dict:
+    """Chờ extension báo kết quả; trả về dict kết quả hoặc ném lỗi."""
+    try:
+        await asyncio.wait_for(job["event"].wait(), timeout=timeout)
+    except asyncio.TimeoutError:
+        raise _as_http_error(
+            TimeoutError("Extension trình duyệt không phản hồi trong thời gian chờ")
+        ) from None
+    if job["error"]:
+        raise _as_http_error(RuntimeError(str(job["error"])))
+    return job["result"] or {}
+
+
+# Bật đường trình duyệt bằng BROWSER_GENERATE=true trong config.json. Tắt mặc định
+# để hành vi cũ (gọi thẳng gemini_webapi) không đổi khi nâng cấp.
+BROWSER_GENERATE = bool(CONFIG.get("browser_generate"))
+
+
+def _file_attachments_from_uploaded(files: list) -> list[dict]:
+    """Đổi metadata file đã upload thành attachment theo khuôn response."""
+    out = []
+    for f in files or []:
+        if not isinstance(f, dict) or not f.get("id"):
+            continue
+        title = f.get("filename") or f.get("title") or "file"
+        out.append({
+            "kind": "file",
+            "id": f["id"],
+            "url": f.get("url") or f"/v1/files/{f['id']}",
+            "title": title,
+            "alt": title,
+            "mime_type": f.get("mime_type") or "",
+            "size": f.get("size") or 0,
+        })
+    return out
+
+
+async def _run_via_browser(prompt: str, model: str, cid: str) -> dict:
+    """Sinh câu trả lời trong Gemini web UI qua extension, rồi chờ kết quả."""
+    job_id = _new_chat_job(prompt, model, cid)
+    logging.info("Job trình duyệt %s: đang chờ extension", job_id[:10])
+    try:
+        result = await _await_chat_job(_CHAT_JOBS[job_id])
+    finally:
+        _drop_chat_job(job_id)
+    return {
+        "text": result.get("text") or "",
+        "files": _file_attachments_from_uploaded(result.get("files")),
+    }
+
+
+_UPLOAD_CORS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+}
+
+
+@app.options("/v1/files/upload", include_in_schema=False)
+async def upload_preflight():
+    return JSONResponse(content=None, headers=_UPLOAD_CORS)
+
+
+@app.get("/v1/files/ping", include_in_schema=False)
+async def filesync_ping(request: Request):
+    """Beacon của content script.
+
+    Không trả gì nhạy cảm và cố ý không yêu cầu API key: điểm của nó là chứng minh
+    `filesync.js` đã thực sự được inject vào trang Gemini. Nếu im lặng mà
+    `/v1/files/upload` cũng không có, thì lỗi nằm ở extension chứ không phải protocol.
+    """
+    logging.info("filesync: content script đã inject (%s)", request.headers.get("origin") or "-")
+    return JSONResponse(content={"ok": True}, headers=_UPLOAD_CORS)
+
+
+@app.post("/v1/files/debug", include_in_schema=False)
+async def filesync_debug(request: Request):
+    """Nhận dấu vết từ content script để xác định capture vỡ ở bước nào.
+
+    Không phải API công khai: nó chỉ ghi log, không trả dữ liệu, và chỉ extension
+    trong tab Gemini mới gọi được. Không có nó thì mọi lỗi extension đều im lặng.
+    """
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    stage = str(payload.get("stage") or "?")[:40]
+    detail = str(payload.get("detail") or "")[:600]
+    if stage == "?":
+        # Không có stage thì in nguyên body: nếu không, dấu vết hỏng mà không
+        # biết là do tầng nào, đoán mò rất tốn thời gian.
+        detail = f"RAW={str(payload)[:500]}"
+    logging.info("filesync[%s] %s", stage, detail)
+    return JSONResponse(content={"ok": True}, headers=_UPLOAD_CORS)
+
+
+# POST + `Content-Type: application/json` la "simple request" co preflight. Thieu
+# route OPTIONS thi trinh duyet chao request truoc khi gui, va content script chi
+# thay mot loi bi nuot im lang.
+@app.options("/v1/files/upload", include_in_schema=False)
+@app.options("/v1/chat/jobs", include_in_schema=False)
+@app.options("/v1/chat/jobs/{job_id}/result", include_in_schema=False)
+@app.options("/v1/files/debug", include_in_schema=False)
+async def filesync_debug_options():
+    return Response(status_code=204, headers=_UPLOAD_CORS)
+
+
+@app.get("/v1/chat/jobs", include_in_schema=False)
+async def chat_jobs(request: Request):
+    """Job sinh câu trả lời đang chờ; extension poll để gõ prompt vào Gemini.
+
+    Không yêu cầu API key: extension lấy key từ storage rồi gửi kèm, nếu bắt
+    buộc key thì endpoint này chỉ hữu dụng khi người dùng đã cấu hình đúng.
+    """
+    now = time.time()
+    pending = [
+        {
+            "job_id": job_id,
+            "prompt": j["prompt"],
+            "model": j["model"],
+            "cid": j["cid"],
+            "age": round(now - j["started"], 1),
+        }
+        for job_id, j in _CHAT_JOBS.items()
+        if not j["event"].is_set()
+    ]
+    return JSONResponse(content={"jobs": pending}, headers=_UPLOAD_CORS)
+
+
+@app.post("/v1/chat/jobs/{job_id}/result", include_in_schema=False)
+async def chat_job_result(job_id: str, request: Request):
+    """Extension báo kết quả (text + file đã upload) cho một job."""
+    job = _CHAT_JOBS.get(job_id)
+    if job is None:
+        return JSONResponse(
+            content={"detail": "Job không tồn tại hoặc đã hết hạn"},
+            status_code=404,
+            headers=_UPLOAD_CORS,
+        )
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if payload.get("error"):
+        job["error"] = str(payload["error"])[:500]
+    else:
+        job["result"] = {
+            "text": (payload.get("text") or "")[:200_000],
+            "files": (payload.get("files") or [])[:20],
+            "cid": payload.get("cid") or job["cid"],
+        }
+    # Luôn in ra: nếu không, khi job báo lỗi ta chỉ thấy HTTP 503 mà không biết
+    # extension gặp rắc gì ở DOM.
+    logging.info(
+        "chat job %s: len(text)=%s files=%s error=%r",
+        job_id[:10],
+        len(job["result"]["text"]) if job.get("result") else "-",
+        len(job["result"]["files"]) if job.get("result") else "-",
+        job.get("error"),
+    )
+    job["event"].set()
+    return JSONResponse(content={"ok": True}, headers=_UPLOAD_CORS)
+
+
+@app.post("/v1/files/upload", dependencies=[Depends(require_key)])
+async def upload_output_file(request: Request):
+    """Nhận file Gemini tạo do extension đẩy lên.
+
+    Body là bytes thô; tên, kiểu và `cid` đi kèm trong query string. Dùng body thô
+    thay vì multipart vì extension gửi từ `fetch` với một `ArrayBuffer`, không cần
+    parser.
+
+    Cần CORS vì người gửi là content script chạy trong trang `https://gemini.google.com`,
+    khác origin với server. Không có nó thì trình duyệt chặn request trước khi tới
+    server, và việc đẩy file sẽ im lặng thất bại.
+    """
+    key = request.query_params.get("key") or ""
+    filename = request.query_params.get("name") or ""
+    declared_mime = request.query_params.get("mime") or ""
+    cid = request.query_params.get("cid") or ""
+    if not key:
+        raise HTTPException(status_code=400, detail="Thiếu tham số 'key'")
+
+    body = await request.body()
+    meta = _store_upload(
+        key=key,
+        data=body,
+        title=filename or key,
+        filename=filename,
+        declared_mime=declared_mime,
+        cid=cid,
+    )
+    if meta is None:
+        raise HTTPException(status_code=413, detail="File rỗng hoặc vượt giới hạn")
+    return JSONResponse(content=meta, headers=_UPLOAD_CORS)
 
 
 async def _collect_attachments(output) -> list[dict]:
@@ -1479,6 +1873,45 @@ async def _collect_attachments(output) -> list[dict]:
             except Exception as e:
                 logging.warning("Bỏ qua audio do lỗi: %s", e)
 
+    # Tài liệu code execution sinh ra (xlsx, docx, pdf, csv, file mã nguồn...).
+    # `cand.files` đã lọc sẵn thứ trùng với ảnh/video, nên chỉ cần giữ tên mà
+    # Gemini tự khai: URL tải không chứa đuôi file nên không có tên thì tải về
+    # không mở được.
+    for f in list(getattr(cand, "files", ()) or ()):
+        name = getattr(f, "name", "") or getattr(f, "title", "") or ""
+        url = getattr(f, "url", "") or ""
+        if not url:
+            # Gemini nói có file nhưng ta không tìm thấy URL tải. Vẫn báo lại để
+            # client biết tên file cần tự xin Gemini nội dung dạng văn bản.
+            if name:
+                items.append(
+                    {
+                        "kind": "file",
+                        "id": None,
+                        "url": None,
+                        "title": name,
+                        "filename": _safe_filename(name, Path(name).suffix or ".bin"),
+                        "mime_type": _mime_for_ext(Path(name).suffix.lower()),
+                        "size": None,
+                        "downloadable": False,
+                    }
+                )
+            continue
+        try:
+            meta = await _store_output(
+                url,
+                name or "file",
+                expected_kind="document",
+                filename=name,
+                declared_mime=getattr(f, "mime_type", "") or "",
+            )
+        except Exception as e:
+            logging.warning("Bỏ qua tài liệu do lỗi: %s", e)
+            continue
+        if meta:
+            meta["kind"] = "file"
+            items.append(meta)
+
     return items
 
 
@@ -1492,10 +1925,17 @@ def _is_img_name(name: str | None) -> bool:
     return bool(name and Path(name).suffix.lower() in _IMAGE_EXTS)
 
 
-def _content_type_ext(content_type: str | None) -> str:
-    if content_type:
-        ext = mimetypes.guess_extension(content_type.split(";")[0].strip().lower())
-        if ext in _IMAGE_EXTS:
+def _content_type_ext(content_type: str | None) -> str | None:
+    if not content_type:
+        return None
+    ctype = content_type.split(";")[0].strip().lower()
+    ext = mimetypes.guess_extension(ctype) or _next_ext_for_mime(ctype)
+    return ext if ext in _IMAGE_EXTS or ext in _DOCUMENT_EXTS else None
+
+
+def _next_ext_for_mime(ctype: str) -> str | None:
+    for ext, mime in _MIME_BY_EXT.items():
+        if mime == ctype:
             return ext
     return None
 
@@ -1518,7 +1958,7 @@ def _sniff_ext(data: bytes) -> str:
 
 def _url_ext(src: str) -> str | None:
     path = urlparse(src).path.lower()
-    return next((e for e in _IMAGE_EXTS if path.endswith(e)), None)
+    return next((e for e in (*_IMAGE_EXTS, *_DOCUMENT_EXTS) if path.endswith(e)), None)
 
 
 async def _load_file(item: dict) -> tuple[bytes, str]:
@@ -2214,6 +2654,9 @@ def _completion_body(cid, created, model, text, tool_call, stream, attachments=N
     if attachments:
         message["attachments"] = attachments
         message["images"] = [a for a in attachments if a.get("kind") == "image"]
+        # `files` là alias cho tài liệu, tách riêng vì client xử lý file khác
+        # hẳn ảnh (tải về, mở bằng app khác) và phần lớn chỉ cần nhìn một nhóm.
+        message["files"] = [a for a in attachments if a.get("kind") == "file"]
 
     deltas = []
     cn = f"chatcmpl-{uuid.uuid4().hex}"
@@ -2230,6 +2673,7 @@ def _completion_body(cid, created, model, text, tool_call, stream, attachments=N
             if attachments:
                 deltas.append(({"attachments": attachments}, None))
                 deltas.append(({"images": message["images"]}, None))
+                deltas.append(({"files": message["files"]}, None))
             deltas.append(({}, finish))
 
         async def stream_body():
@@ -2255,8 +2699,13 @@ async def chat_completions(req: ChatRequest):
     created = int(time.time())
 
     if req.tools:
-        text, tool_call, model, _ = await _generate(req.messages, req.tools, req.model)
-        return _completion_body(cid, created, model, text, tool_call, stream=req.stream)
+        # Phải truyền `attachments` lại: bỏ nó vào `_` làm mọi ảnh và tài liệu
+        # Gemini sinh trong một lượt có tools đều bị rơi — mà agent sinh tài liệu
+        # nhiều hơn bất kỳ loại client nào khác.
+        text, tool_call, model, attachments = await _generate(req.messages, req.tools, req.model)
+        return _completion_body(
+            cid, created, model, text, tool_call, stream=req.stream, attachments=attachments
+        )
 
     prompt = build_prompt(req.messages)
     if not prompt:
@@ -2347,7 +2796,8 @@ async def chat_completions(req: ChatRequest):
                         break
                 if attachments:
                     imgs = [a for a in attachments if a.get("kind") == "image"]
-                    yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {'attachments': attachments, 'images': imgs}, 'finish_reason': None}]})}\n\n"
+                    docs = [a for a in attachments if a.get("kind") == "file"]
+                    yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {'attachments': attachments, 'images': imgs, 'files': docs}, 'finish_reason': None}]})}\n\n"
                 yield f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': req.model, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
             except Exception as e:
                 logging.error("Stream failed: %s", e)
@@ -2359,6 +2809,21 @@ async def chat_completions(req: ChatRequest):
         return _ReleasingStreamingResponse(stream(), release=_release)
 
     c = None
+    # Đường trình duyệt: `generate_content` không tạo file (xem _CHAT_JOBS), nên khi
+    # bật thì bỏ hẳn lời gọi API — gọi rồi ghi đè còn tạo ra conversation rác.
+    if BROWSER_GENERATE:
+        try:
+            result = await _run_via_browser(prompt, model, cid)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logging.error("Browser generate failed: %s", e)
+            raise _as_http_error(e)
+        finally:
+            _cleanup_tmpfiles(tmpfiles)
+        return _completion_body(cid, created, model, result.get("text", ""), None,
+                                stream=False, attachments=result.get("files") or [])
+
     try:
         guard = _guard
         if guard is None:
@@ -2504,6 +2969,7 @@ async def responses(req: ResponsesRequest):
     if attachments:
         body["attachments"] = attachments
         body["images"] = [a for a in attachments if a.get("kind") == "image"]
+        body["files"] = [a for a in attachments if a.get("kind") == "file"]
 
     if req.stream:
         async def stream():

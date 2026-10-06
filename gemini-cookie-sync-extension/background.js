@@ -188,7 +188,36 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
-chrome.runtime.onMessage.addListener((message) => {
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message && message.type === "gemini-job-done") {
+    void (async () => {
+      const jobId = message.jobId || activeJobId;
+      await logFilesync("job-done", `${jobId} files=${(message.files || []).length}`);
+      await postJobResult(jobId, {
+        text: message.text || "",
+        files: message.files?.length ? message.files : activeJobFiles,
+        cid: message.cid || activeJobCid || ""
+      });
+      activeJobId = "";
+      activeJobFiles = [];
+      sendResponse({ ok: true });
+    })();
+    return true; // giữ kênh mở để sendResponse chạy được bất đồng bộ
+  }
+
+  if (message && message.type === "gemini-job-failed") {
+    void (async () => {
+      await logFilesync("job-failed", `${message.jobId || activeJobId}: ${message.error}`);
+      await postJobResult(message.jobId || activeJobId, {
+        error: message.error || "loi khong ro"
+      });
+      activeJobId = "";
+      activeJobFiles = [];
+      sendResponse({ ok: true });
+    })();
+    return true;
+  }
+
   if (message && message.type === "reset-auto-sync") {
     void chrome.storage.local.set({
       autoSyncErrorCount: 0,
@@ -199,6 +228,318 @@ chrome.runtime.onMessage.addListener((message) => {
     void ensureSettings().then((s) => {
       chrome.runtime.sendMessage({ type: "settings-refreshed", settings: s }).catch(() => {});
     });
+  }
+  if (message && message.type === "filesync:context") {
+    lastFileContext = { name: message.name || "", cid: message.cid || "", mime: message.mime || "" };
+  }
+  if (message && message.type === "filesync:url" && message.url?.includes(FILE_DOWNLOAD_MATCH)) {
+    // Đây là đường chính: lấy URL trong hộp thoại xem trước rồi tự tải, không
+    // cần bấm Download thật (tránh tạo file rác trong Downloads của người dùng).
+    if (!pushedUrls.has(message.url)) {
+      pushedUrls.add(message.url);
+      void fetchAndPushUrl(message.url);
+    }
+  }
+});
+
+// ---------- Bắt file Gemini tải về ----------
+// Bytes KHÔNG đến từ `batchexecute?rpcids=ESY5D` như tưởng. Bấm "Download" khiến
+// Chrome tạo một download tới `contribution.usercontent.google.com/download` —
+// origin khác, đi qua download manager chứ không phải XHR, nên hook `fetch` trong
+// trang không thấy gì. Service worker là nơi duy nhất lấy được bytes: `fetch` của
+// nó mang cookie phiên thật (thử bằng urllib + cookie thủ công thì 403).
+const FILE_DOWNLOAD_MATCH = "contribution.usercontent.google.com/download";
+
+const pendingFiles = new Map();
+
+// Một URL chỉ đẩy một lần; trang hay render lại preview và báo lại cùng URL.
+const pushedUrls = new Set();
+
+// Chip vừa xuất hiện; gán cho download kế tiếp để server biết file thuộc
+// conversation nào. Không có nó thì server không nối được file vào response.
+let lastFileContext = null;
+
+async function logFilesync(stage, detail) {
+  try {
+    const s = await ensureSettings();
+    const base = (s.syncBaseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+    await fetch(`${base}/v1/files/debug`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(s.syncApiKey ? { Authorization: `Bearer ${s.syncApiKey}` } : {})
+      },
+      body: JSON.stringify({ stage, detail })
+    });
+  } catch {
+    // Báo lỗi thất bại không được làm hỏng luồng sync.
+  }
+}
+
+async function pushDownloadedFile(downloadId) {
+  const info = pendingFiles.get(downloadId);
+  if (!info) return;
+  pendingFiles.delete(downloadId);
+  try {
+    const s = await ensureSettings();
+    const base = (s.syncBaseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+    const resp = await fetch(info.url, { credentials: "include" });
+    if (!resp.ok) {
+      await logFilesync("dl-fetch-fail", `${resp.status} ${info.name}`);
+      return;
+    }
+    const buf = await resp.arrayBuffer();
+    if (!buf.byteLength) {
+      await logFilesync("dl-empty", info.name);
+      return;
+    }
+    const ctx = lastFileContext || {};
+    const qs = new URLSearchParams({
+      key: `${ctx.cid || "gemini"}|${info.name || "file"}|0`,
+      name: info.name || "",
+      mime: info.mime || "",
+      cid: ctx.cid || ""
+    });
+    const up = await fetch(`${base}/v1/files/upload?${qs}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        ...(s.syncApiKey ? { Authorization: `Bearer ${s.syncApiKey}` } : {})
+      },
+      body: buf
+    });
+    await logFilesync("dl-upload", `${up.status} ${info.name} ${buf.byteLength}B key=${qs.get("key")}`);
+  } catch (e) {
+    await logFilesync("dl-error", `${info.name}: ${e}`);
+  }
+}
+
+async function fetchAndPushUrl(url) {
+  const name = (() => {
+    try {
+      return new URL(url).searchParams.get("filename") || "";
+    } catch {
+      return "";
+    }
+  })();
+  // URL download thuộc origin Drive nên không tự mang cid. Dùng cid của job mà
+  // service worker vừa tự mở tab — đó mới là hội thoại cần file.
+  const cid = activeJobCid || lastFileContext?.cid || "";
+  try {
+    const s = await ensureSettings();
+    const base = (s.syncBaseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+    const resp = await fetch(url, { credentials: "include" });
+    if (!resp.ok) {
+      await logFilesync("url-fetch-fail", `${resp.status} ${name}`);
+      return;
+    }
+    const buf = await resp.arrayBuffer();
+    if (!buf.byteLength) {
+      await logFilesync("url-empty", name);
+      return;
+    }
+    const ctx = lastFileContext || {};
+    const qs = new URLSearchParams({
+      key: `${cid || ctx.cid || "gemini"}|${name || "file"}|0`,
+      name,
+      mime: ctx.mime || "",
+      cid
+    });
+    const up = await fetch(`${base}/v1/files/upload?${qs}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/octet-stream",
+        ...(s.syncApiKey ? { Authorization: `Bearer ${s.syncApiKey}` } : {})
+      },
+      body: buf
+    });
+    await logFilesync("url-upload", `${up.status} ${name} ${buf.byteLength}B key=${qs.get("key")}`);
+    // Gắn vào job đang chạy để server đưa file vào response của câu hỏi đó.
+    if (up.ok && activeJobId) {
+      try {
+        const meta = await up.json();
+        activeJobFiles.push({
+          id: meta.id,
+          url: meta.url,
+          filename: name || meta.filename,
+          mime_type: meta.mime_type,
+          size: meta.size
+        });
+      } catch {
+        /* meta không đọc được thì bỏ, response vẫn trả được text */
+      }
+    }
+  } catch (e) {
+    await logFilesync("url-error", `${name}: ${e}`);
+  }
+}
+
+// ---------- Mở hội thoại để lấy file ----------
+// Server tự sinh câu trả lời qua API nên không có tab nào mở hội thoại đó, mà file
+// chỉ tải được từ web UI. Server đăng ký cid ở `/v1/files/jobs`; extension thấy
+// thì mở `gemini.google.com/app/<cid>`, rồi tự bấm nút tải trong Drive viewer.
+const CHAT_JOB_ALARM = "gemini-chat-jobs";
+const claimedJobs = new Set();   // job_id da giao cho content script
+const doneJobs = new Set();      // job_id da bao ket qua len server
+
+// Job dang chay: moi download phat sinh trong luc nay se gan vao job nay.
+let activeJobId = "";
+let activeJobCid = "";
+let activeJobFiles = [];
+
+async function settingsOrNull() {
+  try {
+    return await ensureSettings();
+  } catch {
+    return null;
+  }
+}
+
+async function postJobResult(jobId, payload) {
+  const s = await settingsOrNull();
+  if (!s) return;
+  const base = (s.syncBaseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+  try {
+    await fetch(`${base}/v1/chat/jobs/${jobId}/result`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(s.syncApiKey ? { Authorization: `Bearer ${s.syncApiKey}` } : {})
+      },
+      body: JSON.stringify(payload)
+    });
+    doneJobs.add(jobId);
+  } catch (e) {
+    await logFilesync("job-post-fail", `${jobId}: ${e}`);
+  }
+}
+
+async function ensureGeminiTab() {
+  const existing = await chrome.tabs.query({ url: "https://gemini.google.com/app*" });
+  if (existing.length) {
+    await chrome.tabs.update(existing[0].id, { active: true });
+    return existing[0].id;
+  }
+  const tab = await chrome.tabs.create({ url: "https://gemini.google.com/app", active: true });
+  return tab.id;
+}
+
+async function checkChatJobs() {
+  const s = await settingsOrNull();
+  if (!s) return;
+  const base = (s.syncBaseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
+  let jobs = [];
+  try {
+    const r = await fetch(`${base}/v1/chat/jobs`, {
+      headers: s.syncApiKey ? { Authorization: `Bearer ${s.syncApiKey}` } : {}
+    });
+    if (!r.ok) return;
+    ({ jobs = [] } = await r.json());
+  } catch {
+    return; // Server chua san sang thi thu o nhip alarm sau.
+  }
+  if (!jobs.length) return;
+
+  // Chi mot job mot luc: Gemini web UI la mot cua so chat, hai job chay song
+  // song se vao cung mot hoi thoai va lan nhau doc ket qua.
+  for (const job of jobs) {
+    if (!job?.job_id || claimedJobs.has(job.job_id) || doneJobs.has(job.job_id)) continue;
+
+    claimedJobs.add(job.job_id);
+    activeJobId = job.job_id;
+    activeJobCid = job.cid || "";
+    activeJobFiles = [];
+
+    let tabId;
+    try {
+      tabId = await ensureGeminiTab();
+    } catch (e) {
+      await postJobResult(job.job_id, { error: `Khong mo duoc tab Gemini: ${e}` });
+      continue;
+    }
+    await logFilesync("job-dispatch", `${job.job_id} tab=${tabId}`);
+    try {
+      await chrome.tabs.sendMessage(tabId, {
+        type: "gemini-run",
+        jobId: job.job_id,
+        prompt: job.prompt,
+        model: job.model
+      });
+    } catch (e) {
+      // Content script chua san sang (tab moi load) -> thu lai.
+      setTimeout(() => {
+        chrome.tabs
+          .sendMessage(tabId, {
+            type: "gemini-run",
+            jobId: job.job_id,
+            prompt: job.prompt,
+            model: job.model
+          })
+          .catch(async (e2) => {
+            await postJobResult(job.job_id, { error: `Khong gui duoc prompt: ${e2}` });
+          });
+      }, 3000);
+    }
+    break; // het job sau, xu ly lap lai o nhip alarm toi
+  }
+}
+
+// Nut tai nam trong iframe Drive viewer, khong thay duoc bang `document` cua trang
+// Gemini. `executeScript` voi `allFrames` la cach chac chan tiem vao dung frame.
+function clickDownloadInFrame() {
+  const sel =
+    'div[aria-label="Tai xuong"], [data-tooltip="Tai xuong"], ' +
+    'button[aria-label="Tai xuong"], button[aria-label*="Download"], ' +
+    '[aria-label*="Tai xuong"], [aria-label*="Download"]';
+  const el = document.querySelector(sel);
+  if (!el) return null;
+  el.click();
+  return el.getAttribute("aria-label") || el.getAttribute("data-tooltip") || "?";
+}
+
+async function tryClickDownload(tabId, attempt) {
+  if (attempt > 20 || !activeJobId) return;
+  try {
+    const res = await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: clickDownloadInFrame
+    });
+    for (const r of res) {
+      if (r.result) {
+        await logFilesync("job-download-click", `nut="${r.result}"`);
+        return;
+      }
+    }
+  } catch {
+    // Tab dang chuyen trang thi thu lai o nhip sau.
+  }
+  setTimeout(() => void tryClickDownload(tabId, attempt + 1), 1500);
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === CHAT_JOB_ALARM) void checkChatJobs();
+});
+
+void chrome.alarms.create(CHAT_JOB_ALARM, { periodInMinutes: 0.5 });
+void checkChatJobs();
+
+chrome.downloads.onCreated.addListener((item) => {
+  if (!item?.url?.includes(FILE_DOWNLOAD_MATCH)) return;
+  let name = "";
+  let mime = "";
+  try {
+    const u = new URL(item.url);
+    name = u.searchParams.get("filename") || "";
+  } catch {
+    // URL giả thì bỏ qua, không chặn download của người dùng.
+  }
+  pendingFiles.set(item.id, { url: item.url, name, mime });
+  void logFilesync("dl-created", `${name} #${item.id}`);
+});
+
+chrome.downloads.onChanged.addListener((delta) => {
+  if (delta?.state?.current === "complete" && pendingFiles.has(delta.id)) {
+    void pushDownloadedFile(delta.id);
   }
 });
 

@@ -24,6 +24,15 @@ from gemini_webapi.utils import (
 if TYPE_CHECKING:
     from curl_cffi.requests import Response
 
+    from gemini_webapi.types import (
+        Citation,
+        GeneratedFile,
+        GeneratedImage,
+        GeneratedMedia,
+        GeneratedVideo,
+        WebImage,
+    )
+
 
 class ChatMixin:
     """Mixin class providing chat management functionality for GeminiClient.
@@ -45,7 +54,16 @@ class ChatMixin:
 
         def _parse_candidate(
             self, candidate_data: list[Any], cid: str, rid: str, rcid: str
-        ) -> tuple[Any, ...]: ...
+        ) -> tuple[
+            str,
+            str,
+            list[WebImage],
+            list[GeneratedImage],
+            list[GeneratedVideo],
+            list[GeneratedMedia],
+            list[GeneratedFile],
+            list[Citation],
+        ]: ...
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -223,6 +241,7 @@ class ChatMixin:
                                 generated_images,
                                 generated_videos,
                                 generated_media,
+                                generated_files,
                                 citations,
                             ) = self._parse_candidate(candidate_data, cid, rid, rcid)
                             document = DeepResearchDocument(**doc_data) if doc_data else None
@@ -238,6 +257,7 @@ class ChatMixin:
                                     generated_images=generated_images,
                                     generated_videos=generated_videos,
                                     generated_media=generated_media,
+                                    generated_files=generated_files,
                                     citations=citations,
                                     deep_research_document=document,
                                 )

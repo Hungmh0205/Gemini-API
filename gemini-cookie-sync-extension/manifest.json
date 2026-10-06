@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Gemini Cookie Sync",
-  "version": "1.3",
-  "description": "Exports Gemini cookies plus XSRF/build metadata and syncs them to a local Gemini-API server.",
+  "version": "1.4",
+  "description": "Exports Gemini cookies plus XSRF/build metadata and syncs them to a local Gemini-API server. Also captures files Gemini generates and uploads them to /v1/files/upload.",
   "permissions": [
     "cookies",
     "downloads",
@@ -20,6 +20,19 @@
   "background": {
     "service_worker": "background.js"
   },
+  "content_scripts": [
+    {
+      "matches": ["https://gemini.google.com/app/*"],
+      "js": ["filesync.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://gemini.google.com/app/*"],
+      "js": ["filesync-page.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
   "action": {
     "default_title": "Gemini Cookie Sync",
     "default_popup": "popup.html"
