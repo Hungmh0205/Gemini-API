@@ -188,11 +188,27 @@ chrome.alarms.onAlarm.addListener((alarm) => {
   }
 });
 
+// Cho den khi khong con download/upload file nao dang chay (hoac het han cho).
+// Phai goi truoc khi bao `gemini-job-done`: upload co the ve cham hon job-done
+// vai tram ms, khien response bi thieu attachment.
+async function settlePendingUploads(maxMs = 25000) {
+  // Nghi toi thieu: preview Drive can vai giay moi phat sinh download sau khi chip
+  // duoc bam, nen mot khoang nghi ngan giup bat duoc truong hop cham.
+  await new Promise((r) => setTimeout(r, 1500));
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (pendingFiles.size === 0 && inflightUploads === 0) return true;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return false;
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message && message.type === "gemini-job-done") {
     void (async () => {
       const jobId = message.jobId || activeJobId;
-      await logFilesync("job-done", `${jobId} files=${(message.files || []).length}`);
+      const settled = await settlePendingUploads();
+      await logFilesync("job-done", `${jobId} files=${(message.files || []).length} settled=${settled}`);
       await postJobResult(jobId, {
         text: message.text || "",
         files: message.files?.length ? message.files : activeJobFiles,
@@ -268,6 +284,10 @@ const FILE_DOWNLOAD_MATCH = "contribution.usercontent.google.com/download";
 
 const pendingFiles = new Map();
 
+// Số upload file đang chạy (fetch + POST). Dùng để `gemini-job-done` đợi upload
+// xong trước khi báo kết quả, tránh response thiếu attachment do race thời gian.
+let inflightUploads = 0;
+
 // Một URL chỉ đẩy một lần; trang hay render lại preview và báo lại cùng URL.
 const pushedUrls = new Set();
 
@@ -296,6 +316,7 @@ async function pushDownloadedFile(downloadId) {
   const info = pendingFiles.get(downloadId);
   if (!info) return;
   pendingFiles.delete(downloadId);
+  inflightUploads++;
   try {
     const s = await ensureSettings();
     const base = (s.syncBaseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
@@ -327,6 +348,8 @@ async function pushDownloadedFile(downloadId) {
     await logFilesync("dl-upload", `${up.status} ${info.name} ${buf.byteLength}B key=${qs.get("key")}`);
   } catch (e) {
     await logFilesync("dl-error", `${info.name}: ${e}`);
+  } finally {
+    inflightUploads--;
   }
 }
 
@@ -341,6 +364,7 @@ async function fetchAndPushUrl(url) {
   // URL download thuộc origin Drive nên không tự mang cid. Dùng cid của job mà
   // service worker vừa tự mở tab — đó mới là hội thoại cần file.
   const cid = activeJobCid || lastFileContext?.cid || "";
+  inflightUploads++;
   try {
     const s = await ensureSettings();
     const base = (s.syncBaseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
@@ -387,6 +411,8 @@ async function fetchAndPushUrl(url) {
     }
   } catch (e) {
     await logFilesync("url-error", `${name}: ${e}`);
+  } finally {
+    inflightUploads--;
   }
 }
 
@@ -524,6 +550,9 @@ async function ensureGeminiTab() {
 async function checkChatJobs() {
   const s = await settingsOrNull();
   if (!s) return;
+  // Chi mot job mot luc: khong dispatch job moi khi job truoc con chay hoac dang
+  // doi upload file xong (settle) — tranh reset activeJobFiles/pendingFiles giua chung.
+  if (activeJobId) return;
   const base = (s.syncBaseUrl || DEFAULT_BASE_URL).replace(/\/+$/, "");
   let jobs = [];
   try {
@@ -546,6 +575,9 @@ async function checkChatJobs() {
     activeJobId = job.job_id;
     activeJobCid = job.cid || "";
     activeJobFiles = [];
+    // Xoa cac download ton dong tu phien/truoc job (chung da xong truoc khi
+    // listener kip gan nen khong bao gio duoc go khoi map -> lam settle treo).
+    pendingFiles.clear();
 
     let tabId;
     try {
