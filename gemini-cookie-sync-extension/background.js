@@ -455,6 +455,62 @@ async function postJobResult(jobId, payload) {
   }
 }
 
+// Dua tab ve man hinh chat moi (/app) truoc moi job de cat ngu canh hoi thoai cu.
+async function openFreshChat(tabId) {
+  let path = "";
+  try {
+    const t = await chrome.tabs.get(tabId);
+    try {
+      path = new URL(t.url || "").pathname;
+    } catch {
+      path = "";
+    }
+  } catch {
+    path = "";
+  }
+  // Dang o dung man hinh chat moi (/app, chua co id hoi thoai) thi khoi reload.
+  if (/^\/app\/?$/.test(path)) return;
+  try {
+    await chrome.tabs.update(tabId, { url: GEMINI_APP_URL, active: true });
+  } catch {
+    return;
+  }
+  // Nghi 800ms de khong doc nham status "complete" cua trang cu truoc khi chuyen trang.
+  await new Promise((r) => setTimeout(r, 800));
+  const deadline = Date.now() + 30000;
+  while (Date.now() < deadline) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t.status === "complete") break;
+    } catch {
+      // tab dang chuyen trang
+    }
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  // Cho content script tiem lai sau khi trang render.
+  await new Promise((r) => setTimeout(r, 500));
+}
+
+// Gui job va thu lai khi content script chua san sang. Chi thu lai khi sendMessage
+// nem loi (job CHUA duoc nhan) nen khong chay trung.
+async function sendJobWithRetry(tabId, job, attempt = 0) {
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "gemini-run",
+      jobId: job.job_id,
+      prompt: job.prompt,
+      model: job.model
+    });
+  } catch (e) {
+    if (attempt >= 15) {
+      await postJobResult(job.job_id, { error: `Khong gui duoc prompt: ${e}` });
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 1000));
+    await sendJobWithRetry(tabId, job, attempt + 1);
+  }
+}
+
 async function ensureGeminiTab() {
   const existing = await chrome.tabs.query({ url: "https://gemini.google.com/app*" });
   if (existing.length) {
@@ -498,29 +554,10 @@ async function checkChatJobs() {
       await postJobResult(job.job_id, { error: `Khong mo duoc tab Gemini: ${e}` });
       continue;
     }
+    // Moi job chay trong hoi thoai moi de khong ke thua "ngu canh" tu choi cu.
+    await openFreshChat(tabId);
     await logFilesync("job-dispatch", `${job.job_id} tab=${tabId}`);
-    try {
-      await chrome.tabs.sendMessage(tabId, {
-        type: "gemini-run",
-        jobId: job.job_id,
-        prompt: job.prompt,
-        model: job.model
-      });
-    } catch (e) {
-      // Content script chua san sang (tab moi load) -> thu lai.
-      setTimeout(() => {
-        chrome.tabs
-          .sendMessage(tabId, {
-            type: "gemini-run",
-            jobId: job.job_id,
-            prompt: job.prompt,
-            model: job.model
-          })
-          .catch(async (e2) => {
-            await postJobResult(job.job_id, { error: `Khong gui duoc prompt: ${e2}` });
-          });
-      }, 3000);
-    }
+    await sendJobWithRetry(tabId, job);
     break; // het job sau, xu ly lap lai o nhip alarm toi
   }
 }
