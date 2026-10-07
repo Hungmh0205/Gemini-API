@@ -113,6 +113,24 @@ class TestChromePaths(unittest.TestCase):
         self.assertIn("--headless=new", cmd)
         self.assertNotIn("--window-position=-32000,-32000", cmd)
 
+    def test_build_command_hidden_offscreen_and_anti_throttle(self):
+        # `hidden`: off-screen nhưng KHÔNG SW_HIDE, kèm cờ chống throttle để
+        # renderer vẫn chạy (Gemini mới dùng được tool tạo file).
+        cmd = build_chrome_command(r"C:\chrome.exe", r"C:\Profiles\P1", hidden="hidden")
+        self.assertIn("--window-position=-32000,-32000", cmd)
+        self.assertNotIn("--headless=new", cmd)
+        self.assertIn("--disable-backgrounding-occluded-windows", cmd)
+        self.assertIn("--disable-renderer-backgrounding", cmd)
+        self.assertIn("--disable-background-timer-throttling", cmd)
+        self.assertIn(
+            "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling", cmd
+        )
+
+    def test_build_command_visible_keeps_throttle_off_flags(self):
+        cmd = build_chrome_command(r"C:\chrome.exe", r"C:\Profiles\P1", hidden="")
+        self.assertNotIn("--window-position=-32000,-32000", cmd)
+        self.assertNotIn("--headless=new", cmd)
+
     def test_build_command_profile_directory_and_extension(self):
         cmd = build_chrome_command(
             r"C:\chrome.exe", r"C:\Clone", hidden="offscreen",

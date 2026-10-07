@@ -71,6 +71,7 @@ _hwnd_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 GWL_EXSTYLE = -20
 WS_EX_TOOLWINDOW = 0x00000080
 SW_HIDE = 0
+SW_SHOWNOACTIVATE = 4
 
 
 class ChromeProfile(NamedTuple):
@@ -632,7 +633,16 @@ def build_chrome_command(
     # Chrome >= 137 bỏ qua cờ này, nhưng Chromium/Edge vẫn dùng được: để dự phòng.
     if ext_dir and os.path.isdir(ext_dir):
         cmd.append(f"--load-extension={os.path.abspath(ext_dir)}")
-    if hidden == "offscreen":
+    # Cửa sổ off-screen (ngoài màn hình) vẫn bị Chrome coi là "occluded" và bóp
+    # timer/renderer, khiến Gemini không dùng tool (không tạo file). Các cờ dưới
+    # giữ renderer luôn chạy dù cửa sổ nằm ngoài màn hình. Vô hại với visible.
+    cmd += [
+        "--disable-backgrounding-occluded-windows",
+        "--disable-renderer-backgrounding",
+        "--disable-background-timer-throttling",
+        "--disable-features=CalculateNativeWinOcclusion,IntensiveWakeUpThrottling",
+    ]
+    if hidden in ("offscreen", "hidden"):
         cmd += ["--window-position=-32000,-32000", "--window-size=1200,800"]
     elif hidden == "headless":
         cmd += ["--headless=new"]
@@ -667,6 +677,55 @@ def hide_chrome_windows(pids) -> int:
     if hidden[0]:
         log.info("Đã ẩn %d cửa sổ Chrome (pids=%s) khỏi màn hình + taskbar.", hidden[0], sorted(targets))
     return hidden[0]
+
+
+def obscure_chrome_windows(pids) -> int:
+    """Ẩn cửa sổ Chrome khỏi taskbar/Alt+Tab nhưng KHÔNG ẩn màn hình.
+
+    Khác `hide_chrome_windows`: tuyệt đối không gọi `SW_HIDE`, vì cửa sổ bị
+    `SW_HIDE` khiến tab thành `visibilityState="hidden"` và Gemini không chạy
+    tool (không tạo file). Ở đây chỉ gắn `WS_EX_TOOLWINDOW` (bỏ khỏi taskbar +
+    Alt+Tab) rồi hiện lại không kích hoạt, để renderer vẫn chạy bình thường.
+    """
+    if isinstance(pids, int):
+        pids = {pids}
+    targets = {int(p) for p in pids}
+    if not targets:
+        return 0
+    user32 = ctypes.windll.user32
+    SWP_NOSIZE = 0x0001
+    SWP_NOMOVE = 0x0002
+    SWP_NOZORDER = 0x0004
+    SWP_NOACTIVATE = 0x0010
+    SWP_FRAMECHANGED = 0x0020
+    done = [0]
+
+    @_hwnd_type
+    def _cb(hwnd, _):
+        wpid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(wpid))
+        if wpid.value in targets and user32.IsWindowVisible(hwnd):
+            user32.SetWindowLongW(hwnd, GWL_EXSTYLE, user32.GetWindowLongW(hwnd, GWL_EXSTYLE) | WS_EX_TOOLWINDOW)
+            # SetWindowPos với SWP_FRAMECHANGED để style toolwindow ăn ngay,
+            # SWP_NOACTIVATE để không cướp focus của người dùng.
+            user32.SetWindowPos(
+                hwnd, 0, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+            )
+            user32.ShowWindow(hwnd, SW_SHOWNOACTIVATE)
+            done[0] += 1
+        return True
+
+    try:
+        user32.EnumWindows(_cb, 0)
+    except Exception as e:
+        log.warning("Không thể ẩn cửa sổ Chrome khỏi taskbar (pids=%s): %s", sorted(targets), e)
+    if done[0]:
+        log.info(
+            "Đã ẩn %d cửa sổ Chrome khỏi taskbar (vẫn render, pids=%s).",
+            done[0], sorted(targets),
+        )
+    return done[0]
 
 
 def _pid_alive(pid: int) -> bool:
@@ -805,6 +864,10 @@ def launch_profile(
         time.sleep(4)
         # Chrome có thể đổi pid của browser process, nên quét theo --user-data-dir.
         hide_chrome_windows(set(profile_running_pids(profile)) | {proc.pid})
+    elif hidden == "hidden":
+        time.sleep(4)
+        # Giữ renderer chạy: chỉ bỏ khỏi taskbar/Alt+Tab, không SW_HIDE.
+        obscure_chrome_windows(set(profile_running_pids(profile)) | {proc.pid})
     return proc.pid
 
 
@@ -1066,7 +1129,7 @@ async def browser_supervisor(browser_cfg: dict) -> None:
     mode = "offscreen" if mode is None else str(mode).strip().lower()
     if mode in ("", "visible"):
         mode = "visible"
-    elif mode not in ("offscreen", "headless"):
+    elif mode not in ("offscreen", "headless", "hidden"):
         mode = "offscreen"
     keep_alive = bool(browser_cfg.get("keep_alive", True))
     url = str(browser_cfg.get("gemini_url") or GEMINI_URL)
@@ -1354,7 +1417,7 @@ if __name__ == "__main__":
         raise SystemExit(0 if work else 1)
 
     if os.environ.get("BROWSER_KEEPALIVE", "0") == "1":
-        cfg.update({"enabled": True, "hidden": "offscreen", "keep_alive": True})
+        cfg.update({"enabled": True, "hidden": "hidden", "keep_alive": True})
         asyncio.run(browser_supervisor(cfg))
     else:
         work = prepare_work_profile(cfg)
@@ -1364,7 +1427,7 @@ if __name__ == "__main__":
         if not extension_installed_in(work.profile_dir):
             print(INSTALL_HINT)
             raise SystemExit(1)
-        launch_profile(work.user_data_dir, hidden="offscreen",
+        launch_profile(work.user_data_dir, hidden="hidden",
                        ext_dir=str(EXT_DIR), profile_directory=work.name)
         print(f"Launched profile={work.user_data_dir} name={work.name} -> Gemini (ẩn).")
         asyncio.run(wait_for_auth(cfg["health_url"], 180))

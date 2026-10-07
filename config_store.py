@@ -61,7 +61,7 @@ _NESTED_ENV = {
     ("browser", "chrome_path"): "GEMINI_CHROME_PATH",
 }
 
-HIDDEN_MODES = ("offscreen", "headless", "")
+HIDDEN_MODES = ("offscreen", "headless", "hidden", "")
 
 
 class BrowserConfig(BaseModel):
@@ -74,7 +74,7 @@ class BrowserConfig(BaseModel):
     user_data_dir: str = ""
     profile_directory: str = "Lumi-Agent"
     chrome_path: str = ""
-    hidden: str = "offscreen"
+    hidden: str = "hidden"
     keep_alive: bool = True
     close_on_exit: bool = True
     close_timeout: float = 25.0
