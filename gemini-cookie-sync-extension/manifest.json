@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Gemini Cookie Sync",
-  "version": "1.4",
+  "version": "1.5",
   "description": "Exports Gemini cookies plus XSRF/build metadata and syncs them to a local Gemini-API server. Also captures files Gemini generates and uploads them to /v1/files/upload.",
   "permissions": [
     "cookies",
@@ -9,11 +9,15 @@
     "tabs",
     "scripting",
     "storage",
-    "alarms"
+    "alarms",
+    "webRequest",
+    "debugger"
   ],
   "host_permissions": [
     "https://google.com/*",
     "https://*.google.com/*",
+    "https://contribution.usercontent.google.com/*",
+    "https://*.googleusercontent.com/*",
     "http://127.0.0.1/*",
     "http://localhost/*"
   ],

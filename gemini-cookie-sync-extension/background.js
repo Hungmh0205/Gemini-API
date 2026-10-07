@@ -231,16 +231,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
   if (message && message.type === "filesync:context") {
     lastFileContext = { name: message.name || "", cid: message.cid || "", mime: message.mime || "" };
-  }
-  if (message && message.type === "filesync:url" && message.url?.includes(FILE_DOWNLOAD_MATCH)) {
-    // Đây là đường chính: lấy URL trong hộp thoại xem trước rồi tự tải, không
-    // cần bấm Download thật (tránh tạo file rác trong Downloads của người dùng).
-    if (!pushedUrls.has(message.url)) {
-      pushedUrls.add(message.url);
-      void fetchAndPushUrl(message.url);
+    // Vừa phát hiện chip -> thử bấm nút "Tải xuống" trong preview bằng cách tiêm
+    // vào MỌI frame (Drive viewer là iframe khác origin). tryClickDownload tự thử
+    // lại nhiều nhịp nên không cần chờ preview mở xong.
+    if (sender?.tab?.id != null) {
+      setTimeout(() => void tryClickDownload(sender.tab.id, 0), 1200);
     }
   }
-});
+  if (message && message.type === "filesync:url") {
+    const url = message.url || "";
+    if (url.includes(FILE_DOWNLOAD_MATCH) || /googleusercontent\.com\/gg-dl\//i.test(url)) {
+      if (!pushedUrls.has(url)) {
+        pushedUrls.add(url);
+        void fetchAndPushUrl(url);
+      }
+    }
+  }
+  if (message && message.type === "filesync:clickat") {
+    // Click tổng hợp (isTrusted=false) bị Drive viewer bỏ qua; dùng CDP
+    // Input.dispatchMouseEvent để tạo click trusted, đủ điều kiện cho download.
+    const tabId = sender?.tab?.id;
+    void logFilesync("clickat-recv", `tab=${tabId} x=${message.x} y=${message.y}`);
+    if (typeof tabId === "number") {
+      void trustedClick(tabId, message.x, message.y);
+    }
+  }
+  });
 
 // ---------- Bắt file Gemini tải về ----------
 // Bytes KHÔNG đến từ `batchexecute?rpcids=ESY5D` như tưởng. Bấm "Download" khiến
@@ -374,6 +390,31 @@ async function fetchAndPushUrl(url) {
   }
 }
 
+// Bấm nút bằng CDP để tạo sự kiện trusted (dot.click() tổng hợp bị Drive bỏ qua).
+async function trustedClick(tabId, x, y) {
+  const target = { tabId };
+  try {
+    await chrome.debugger.attach(target, "1.3");
+  } catch (e) {
+    await logFilesync("dbg-attach-fail", String(e && e.message ? e.message : e));
+    return;
+  }
+  const px = Math.max(1, Math.round(x));
+  const py = Math.max(1, Math.round(y));
+  const base = { x: px, y: py, button: "left", clickCount: 1 };
+  try {
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseMoved", x: px, y: py });
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mousePressed", ...base });
+    await new Promise((r) => setTimeout(r, 60));
+    await chrome.debugger.sendCommand(target, "Input.dispatchMouseEvent", { type: "mouseReleased", ...base });
+    await logFilesync("dbg-click", `(${px},${py})`);
+  } catch (e) {
+    await logFilesync("dbg-click-err", String(e && e.message ? e.message : e));
+  } finally {
+    setTimeout(() => { chrome.debugger.detach(target).catch(() => {}); }, 4000);
+  }
+}
+
 // ---------- Mở hội thoại để lấy file ----------
 // Server tự sinh câu trả lời qua API nên không có tab nào mở hội thoại đó, mà file
 // chỉ tải được từ web UI. Server đăng ký cid ở `/v1/files/jobs`; extension thấy
@@ -487,10 +528,19 @@ async function checkChatJobs() {
 // Nut tai nam trong iframe Drive viewer, khong thay duoc bang `document` cua trang
 // Gemini. `executeScript` voi `allFrames` la cach chac chan tiem vao dung frame.
 function clickDownloadInFrame() {
-  const sel =
-    'div[aria-label="Tai xuong"], [data-tooltip="Tai xuong"], ' +
-    'button[aria-label="Tai xuong"], button[aria-label*="Download"], ' +
-    '[aria-label*="Tai xuong"], [aria-label*="Download"]';
+  const sel = [
+    '[aria-label="Tải xuống"]',
+    '[aria-label="Tải về"]',
+    '[aria-label="Tai xuong"]',
+    '[aria-label*="Tải xuống"]',
+    '[aria-label*="Tải về"]',
+    '[aria-label*="Tai xuong"]',
+    '[aria-label*="Download"]',
+    'button[aria-label*="Download"]',
+    '[data-tooltip*="Tải xuống"]',
+    '[data-tooltip*="Tai xuong"]',
+    '[data-tooltip*="Download"]'
+  ].join(", ");
   const el = document.querySelector(sel);
   if (!el) return null;
   el.click();
@@ -542,6 +592,35 @@ chrome.downloads.onChanged.addListener((delta) => {
     void pushDownloadedFile(delta.id);
   }
 });
+
+// ---------- Bắt URL file qua webRequest (bất kể frame/iframe) ----------
+// Preview Drive nạp file bên trong iframe khác origin nên hook `fetch` của trang
+// Gemini (filesync-page.js) không thấy; mà `chrome.downloads` cũng không phát
+// sinh khi nút "Tải xuống" bị Drive bỏ qua (click tổng hợp không phải user
+// gesture). webRequest thấy MỌI request, kể cả trong iframe, nên đây là chỗ chắc
+// chắn nhất để lấy URL, rồi service worker tự tải bytes bằng cookie phiên thật.
+const FILE_URL_FILTER = [
+  "*://contribution.usercontent.google.com/download*",
+  "*://*.googleusercontent.com/gg-dl/*"
+];
+
+function isDeliverableFileUrl(url) {
+  if (typeof url !== "string") return false;
+  if (url.includes(FILE_DOWNLOAD_MATCH)) return true;
+  return /googleusercontent\.com\/gg-dl\//i.test(url);
+}
+
+chrome.webRequest.onBeforeRequest.addListener(
+  (details) => {
+    const url = details.url || "";
+    if (!isDeliverableFileUrl(url)) return;
+    if (pushedUrls.has(url)) return;
+    pushedUrls.add(url);
+    void logFilesync("wr-url", `via=${details.type} ${url.slice(0, 180)}`);
+    void fetchAndPushUrl(url);
+  },
+  { urls: FILE_URL_FILTER }
+);
 
 // ---------- Đẩy nhanh khi sự kiện xảy ra (debounced) ----------
 let earlySyncTimer = null;

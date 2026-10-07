@@ -1062,8 +1062,11 @@ async def browser_supervisor(browser_cfg: dict) -> None:
         return
 
     chrome_path = str(browser_cfg.get("chrome_path") or "").strip()
-    mode = browser_cfg.get("hidden", "offscreen") or "offscreen"
-    if mode not in ("offscreen", "headless"):
+    mode = browser_cfg.get("hidden", "offscreen")
+    mode = "offscreen" if mode is None else str(mode).strip().lower()
+    if mode in ("", "visible"):
+        mode = "visible"
+    elif mode not in ("offscreen", "headless"):
         mode = "offscreen"
     keep_alive = bool(browser_cfg.get("keep_alive", True))
     url = str(browser_cfg.get("gemini_url") or GEMINI_URL)

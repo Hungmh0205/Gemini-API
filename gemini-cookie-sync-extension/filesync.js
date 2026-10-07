@@ -37,19 +37,47 @@ function responseId() {
   return m ? m[1] : "";
 }
 
-// Chip file giu metadata o `jslog` (base64). Giai ma de lay r_/c_ thi cham hon
-// la doc DOM, va `jslog` la noi duy nhat server chup duoc de doi chieu.
+// Chip file giu metadata o `jslog`. `jslog` KHONG phai base64 thuan: no la
+// `227227;track:...;BardVeMetadataKey:<base64>` nen `atob(raw)` luon nem loi
+// (tung log "undecodable"). Phai tach rieng phan sau `BardVeMetadataKey:` roi
+// giai ma, tu do lay `c_...` (conversation id) va `r_...`/`l_...` (response id).
+function b64ToText(s) {
+  let t = String(s).replace(/-/g, "+").replace(/_/g, "/");
+  while (t.length % 4) t += "=";
+  return atob(t);
+}
+
 function idsFromChip(chip) {
   const raw = chip?.getAttribute?.("jslog");
   if (!raw) return {};
-  try {
-    const json = atob(raw);
-    const r = json.match(/\br_[A-Za-z0-9_-]+/);
-    const c = json.match(/\bc_[A-Za-z0-9_-]+/);
-    return { rcid: r ? r[0] : "", cid: c ? c[0] : "" };
-  } catch {
-    return {};
+  const found = { rcid: "", cid: "" };
+  const scan = (text) => {
+    if (!text) return;
+    const rc = text.match(/\bc_[A-Za-z0-9_-]+/);
+    const rr = text.match(/\b[rl]_[A-Za-z0-9_-]+/);
+    if (rc && !found.cid) found.cid = rc[0];
+    if (rr && !found.rcid) found.rcid = rr[0];
+  };
+  // 1) Giai ma phan base64 sau BardVeMetadataKey (duong dung).
+  const m = raw.match(/BardVeMetadataKey:([A-Za-z0-9+/_=-]+)/);
+  if (m) {
+    try {
+      scan(b64ToText(m[1]));
+    } catch {
+      // gia tri khong phai base64 hop le, thu tiep duong khac
+    }
   }
+  // 2) Neu jslog chi la base64 thuan (khong co tien to).
+  if (!found.cid && !found.rcid) {
+    try {
+      scan(b64ToText(raw));
+    } catch {
+      // khong decode duoc thi quet chuoi tho ben duoi
+    }
+  }
+  // 3) Quet truc tiep chuoi tho (de phong jslog da lo san id).
+  if (!found.cid && !found.rcid) scan(raw);
+  return found;
 }
 
 // Icon cua chip file la https://drive-thirdparty.googleusercontent.com/32/type/<mime>
@@ -274,6 +302,7 @@ function probeDownloadUrls() {
 // không phải fetch của trang, và hook URL ở MAIN world không thấy được.
 // `chrome.downloads.onCreated` trong service worker mới là chỗ bắt được bytes.
 const DOWNLOAD_LABEL_RE = /(tải xuống|tai xuong|download)/i;
+let clickAtSent = false;
 
 async function clickDownloadInPreview() {
   for (let i = 0; i < 12; i++) {
@@ -286,7 +315,22 @@ async function clickDownloadInPreview() {
       break;
     }
     if (hit) {
-      void diag("dl-click", `bam "${(hit.getAttribute("aria-label") || hit.textContent || "").trim().slice(0, 40)}"`);
+      const label = (hit.getAttribute("aria-label") || hit.textContent || "").trim();
+      void diag("dl-click", `bam "${label.slice(0, 40)}"`);
+      if (!clickAtSent) {
+        clickAtSent = true;
+        // Click tong hop (isTrusted=false) bi Drive bo qua; nho service worker
+        // bam lai bang CDP (trusted) tai toa do nut nay.
+        try {
+          const r = hit.getBoundingClientRect();
+          const cx = r.left + r.width / 2;
+          const cy = r.top + r.height / 2;
+          void diag("clickat-send", `x=${cx} y=${cy}`);
+          chrome.runtime.sendMessage({ type: "filesync:clickat", x: cx, y: cy, label: label.slice(0, 40) });
+        } catch (e) {
+          void diag("clickat-send-err", String(e));
+        }
+      }
       hit.click();
       return true;
     }
@@ -436,6 +480,7 @@ async function waitForReply(timeoutMs) {
 
 async function runJob({ jobId, prompt }) {
   try {
+    clickAtSent = false;
     await diag("job-run", `job=${jobId} prompt="${String(prompt).slice(0, 60)}"`);
     await waitForIdleComposer();
     await typePrompt(prompt);

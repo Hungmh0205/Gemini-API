@@ -97,7 +97,7 @@ class BrowserConfig(BaseModel):
     @field_validator("hidden")
     @classmethod
     def _hidden_known(cls, v: str) -> str:
-        v = (v or "offscreen").strip()
+        v = ("" if v is None else str(v)).strip()
         if v not in HIDDEN_MODES:
             raise ValueError(f"browser.hidden phải là một trong {HIDDEN_MODES}")
         return v

@@ -421,7 +421,7 @@ async def browser_start():
             chrome_launcher.launch_profile,
             target.user_data_dir,
             str(bcfg.get("chrome_path") or ""),
-            str(bcfg.get("hidden") or "offscreen"),
+            str(bcfg["hidden"]) if "hidden" in bcfg else "offscreen",
             str(bcfg.get("gemini_url") or chrome_launcher.GEMINI_URL),
             str(bcfg.get("ext_dir") or chrome_launcher.EXT_DIR),
             target.name,

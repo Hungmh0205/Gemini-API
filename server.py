@@ -307,6 +307,22 @@ def load_cookies(path: Path) -> dict:
     raise RuntimeError(f"Unsupported auth file format: {path}")
 
 
+# --- Upload file qua proxy ---------------------------------------------------
+# `content-push.googleapis.com` reset TLS khi gọi trực tiếp bằng curl_cffi từ
+# mạng hiện tại; đi proxy thì được. Chỉ ảnh hưởng thao tác upload, không đụng
+# phiên/auth của phần sinh nội dung. Xem upload_proxy.py.
+_UPLOAD_PROXY_ENV = os.getenv("GEMINI_UPLOAD_PROXY")
+_upload_proxy_cfg = dict(CONFIG.get("upload_proxy") or {})
+if _UPLOAD_PROXY_ENV is not None:
+    _upload_proxy_cfg["enabled"] = _UPLOAD_PROXY_ENV.strip().lower() not in ("0", "false", "no", "off")
+try:
+    import upload_proxy
+
+    upload_proxy.install(_upload_proxy_cfg)
+except Exception as _e:  # noqa: BLE001 - không được làm server chết vì proxy
+    logging.warning("Không cài được upload proxy: %s", _e)
+
+
 def build_client() -> GeminiClient:
     cookies = load_cookies(AUTH_FILE)
     psid = cookies.get("__Secure-1PSID")
