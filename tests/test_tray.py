@@ -11,6 +11,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -147,6 +148,157 @@ class TestRestartPolicy(unittest.TestCase):
         # Đẩy lịch sử ra ngoài cửa sổ -> được phép thử lại.
         self.s.restarts = [t - tray.FAST_RESTART_WINDOW - 1 for t in self.s.restarts]
         self.assertTrue(self.s.should_restart(1))
+
+    def test_slow_crash_loop_is_also_stopped(self):
+        """Vòng lặp CHẬM: mỗi lần chạy 200s rồi chết, cách nhau 300s.
+
+        Cửa sổ `FAST_RESTART_WINDOW` không bao giờ đầy trong trường hợp này, nên
+        chỉ có trần tổng mới chặn được. Trước khi có nó, tray spawn vô hạn suốt
+        đêm với một cấu hình hỏng.
+        """
+        real = time.monotonic
+        clock = {"t": 1000.0}
+        with mock.patch.object(tray.time, "monotonic", lambda: clock["t"]):
+            stopped_at = None
+            for i in range(tray.MAX_TOTAL_RESTARTS + 15):
+                clock["t"] += 200 + 300  # chạy 200s, chết, nghỉ 300s
+                self.s.started_at = clock["t"] - 200
+                self.s.became_healthy = False
+                if not self.s.should_restart(1):
+                    stopped_at = i + 1
+                    break
+        time.monotonic = real
+        self.assertIsNotNone(stopped_at, "vòng lặp chậm phải bị chặn")
+        self.assertLessEqual(stopped_at, tray.MAX_TOTAL_RESTARTS + 1)
+        self.assertIn("bật lại", self.s.last_error)
+
+    def test_healthy_run_resets_backoff(self):
+        """Đã từng phục vụ được rồi mới hỏng -> không tính là lỗi lặp lại."""
+        self.s.consecutive = 12
+        self.s.became_healthy = True
+        self.s.started_at = time.monotonic() - (tray.HEALTHY_AFTER + 1)
+        self.assertTrue(self.s.should_restart(1))
+        self.assertEqual(self.s.consecutive, 1)
+
+    def test_long_run_that_never_came_up_does_not_reset(self):
+        """Sống 5 phút rồi chết mà chưa từng phục vụ -> vẫn phải đếm.
+
+        Reset theo thời gian sống là một lỗi dễ mắc: server cấu hình sai vẫn
+        treo `client_init()` được vài phút rồi mới chết, nên nó sẽ không bao giờ
+        bị chặn.
+        """
+        self.s.consecutive = 12
+        self.s.became_healthy = False
+        self.s.started_at = time.monotonic() - 300
+        self.s.restarts = []
+        self.assertTrue(self.s.should_restart(1))
+        self.assertEqual(self.s.consecutive, 13)
+
+    def test_backoff_grows_and_is_capped(self):
+        seen = []
+        for _ in range(10):
+            self.s.should_restart(1)
+            self.s.restarts = []  # bỏ ràng buộc cửa sổ nhanh
+            seen.append(self.s.restart_delay())
+        self.assertEqual(seen[0], tray.RESTART_BACKOFF[0])
+        self.assertGreater(seen[3], seen[0])
+        self.assertLessEqual(max(seen), max(tray.RESTART_BACKOFF))
+
+    def test_reset_backoff_clears_state(self):
+        """Người dùng sửa xong bấm menu -> phải thử lại được ngay."""
+        self.s.consecutive = tray.MAX_TOTAL_RESTARTS + 5
+        self.s.restarts = [time.monotonic()] * 10
+        self.assertFalse(self.s.should_restart(1), "trước khi reset thì phải bị chặn")
+        self.s.reset_backoff()
+        self.assertTrue(self.s.should_restart(1))
+
+
+class TestHonestStatus(unittest.TestCase):
+    """Menu không được mời bấm "Khởi động server" khi server đang khởi động."""
+
+    def setUp(self):
+        self.fake = FakeServer()
+        self.addCleanup(self.fake.stop)
+        self.s = tray.ServerProcess(self.fake.settings)
+
+    def test_running_server_reports_ok(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        self.s.proc = proc
+        with mock.patch.object(tray, "health", return_value={"status": "ok"}):
+            self.assertEqual(self.s.status(), "ok")
+            self.assertEqual(self.s.status_text(), "đang chạy")
+
+    def test_dead_server_reports_stopped(self):
+        proc = mock.Mock()
+        proc.poll.return_value = 1
+        self.s.proc = proc
+        with mock.patch.object(tray, "health", return_value=None):
+            self.assertEqual(self.s.status(), "stopped")
+            self.assertFalse(self.s.alive())
+
+    def test_starting_server_is_not_offered_a_duplicate_start(self):
+        """Tiến trình còn sống nhưng `/health` chưa mở -> "đang khởi động".
+
+        Nếu gộp thành "đã dừng", menu bật nút "Khởi động server"; bấm là spawn
+        thêm một server, cái mới lập tức crash vì cổng đã bị chiếm.
+        """
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        self.s.proc = proc
+        self.s.started_at = time.monotonic()
+        with mock.patch.object(tray, "health", return_value=None):
+            self.assertEqual(self.s.status(), "starting")
+            self.assertTrue(self.s.alive(), "phải coi là còn sống để không mời bật lại")
+            self.assertIn("đang khởi động", self.s.status_text())
+
+    def test_status_text_reports_error_instead_of_pretending_ok(self):
+        self.s.last_error = "Server không giữ được trạng thái"
+        with mock.patch.object(tray, "health", return_value=None):
+            self.assertIn("không giữ được", self.s.status_text())
+
+
+class TestStartupStateFile(unittest.TestCase):
+    """Phân biệt "Lumi đang khởi động" với "chương trình khác chiếm cổng"."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "server-startup.json"
+
+    def write(self, data) -> None:
+        self.path.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_missing_file(self):
+        self.assertIsNone(tray.startup_server_age(self.path))
+
+    def test_live_pid_reports_age(self):
+        self.write({"pid": os.getpid(), "started_at": time.time()})
+        got = tray.startup_server_age(self.path)
+        self.assertIsNotNone(got)
+        self.assertEqual(got[1], str(os.getpid()))
+
+    def test_dead_pid_ignored(self):
+        self.write({"pid": 999999, "started_at": time.time()})
+        self.assertIsNone(tray.startup_server_age(self.path),
+                          "pid chết thì file chỉ là rác, không phải server đang chạy")
+
+    def test_too_old_ignored(self):
+        self.write({"pid": os.getpid(), "started_at": time.time() - 9999})
+        self.assertIsNone(tray.startup_server_age(self.path))
+
+    def test_corrupt_file_ignored(self):
+        self.path.write_text("{khong phai json", encoding="utf-8")
+        self.assertIsNone(tray.startup_server_age(self.path))
+
+    def test_bogus_shapes_ignored(self):
+        for bad in ({"pid": "x", "started_at": time.time()},
+                    {"pid": os.getpid()},
+                    {"started_at": time.time()},
+                    {"pid": os.getpid(), "started_at": "x"}):
+            with self.subTest(bad=bad):
+                self.write(bad)
+                self.assertIsNone(tray.startup_server_age(self.path))
 
 
 class TestAdoptExistingServer(unittest.TestCase):

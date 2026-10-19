@@ -41,11 +41,76 @@ BROWSER_TYPE: BrowserTypeLiteral = (
     "chrome145"  # Default to chrome145 to avoid Device Bound Session Credentials
 )
 
+# Gemini reports a generated document in reply text as a `sandbox:` placeholder rather
+# than a URL - `sandbox:/mnt/data/report.xlsx` - because the file itself lives behind an
+# opaque download URL elsewhere in the response. The placeholder is the only place the
+# original filename is stated in the clear, so it is what tells us both that a document was
+# produced and how it should be named on delivery.
+
+# Downloadable document formats Gemini's code execution can produce. Keyed by extension
+# because the delivery URL usually carries no extension while the `sandbox:` placeholder
+# does - the extension is the reliable half of the pair. `mimetypes.guess_extension` is
+# consulted first for the rest, since it already covers the common ones.
+DOCUMENT_MIME_TYPES: dict[str, str] = {
+    ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    ".xls": "application/vnd.ms-excel",
+    ".csv": "text/csv",
+    ".tsv": "text/tab-separated-values",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".doc": "application/msword",
+    ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".odt": "application/vnd.oasis.opendocument.text",
+    ".ods": "application/vnd.oasis.opendocument.spreadsheet",
+    ".pdf": "application/pdf",
+    ".rtf": "application/rtf",
+    ".tex": "application/x-tex",
+    ".md": "text/markdown",
+    ".txt": "text/plain",
+    ".json": "application/json",
+    ".xml": "application/xml",
+    ".html": "text/html",
+    ".htm": "text/html",
+    ".py": "text/x-python",
+    ".js": "text/javascript",
+    ".ts": "text/x-typescript",
+    ".java": "text/x-java-source",
+    ".c": "text/x-c",
+    ".cpp": "text/x-c++src",
+    ".cs": "text/x-csharp",
+    ".go": "text/x-go",
+    ".rs": "text/x-rust",
+    ".rb": "text/x-ruby",
+    ".php": "text/x-php",
+    ".sh": "application/x-sh",
+    ".sql": "application/sql",
+    ".yaml": "application/yaml",
+    ".yml": "application/yaml",
+    ".toml": "application/toml",
+    ".ipynb": "application/x-ipynb+json",
+    ".zip": "application/zip",
+    ".gz": "application/gzip",
+    ".tar": "application/x-tar",
+    ".epub": "application/epub+zip",
+}
+
+# Matches any document extension anywhere in a string. Used to find where a sandbox
+# filename ends, since a filename may contain spaces and prose follows it on the same line.
+# Sorted longest first so `.xlsx` is tried before `.xls`; `re` alternation is first-match,
+# not longest-match.
+DOCUMENT_NAME_RE = re.compile(
+    r"\.(?:"
+    + "|".join(sorted({e[1:] for e in DOCUMENT_MIME_TYPES}, key=len, reverse=True))
+    + r")\b",
+    re.IGNORECASE,
+)
+
 CARD_CONTENT_RE = re.compile(r"^https?://googleusercontent\.com/card_content/\d+")
 # Placeholder links Gemini leaves in reply text where a rendered attachment belongs. The
 # path can carry several segments - a web image search returns
 # `image_collection/image_retrieval/<id>` - which a single-segment pattern left behind.
-ARTIFACTS_RE = re.compile(r"https?://googleusercontent\.com/(?:\w+/)+\d+\n*")
+# The final segment may contain underscores and trailing digits (e.g. `…/123456_711`),
+# so we match any word-chars run rather than bare `\d+` to avoid leaving `_711` debris.
+ARTIFACTS_RE = re.compile(r"https?://googleusercontent\.com/(?:\w+/)+\w+\n*")
 MODEL_PREFIX_RE = re.compile(r"^gemini-(?:\d+(?:\.\d+)?-)?")
 DEFAULT_METADATA = ["", "", "", None, None, None, None, None, None, ""]
 

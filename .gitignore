@@ -226,3 +226,11 @@ logs/
 # Python portable đi kèm repo (~50MB, không ai cần trong git)
 python_portable/
 venv*/
+
+# Startup state runtime: server.py ghi ra day trong lifespan, xoa ngay sau khi
+# client.init() xong. File tam, KHONG phai config, KHONG commit.
+/server-startup.json
+
+# Cache media Gemini sinh ra (server.py tai anh ve roi phuc vu qua /v1/files/).
+# La du lieu cua tai khoan Google thuc, KHONG commit.
+/cache/

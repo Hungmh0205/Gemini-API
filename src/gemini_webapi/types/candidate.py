@@ -4,6 +4,7 @@ from textwrap import shorten
 from pydantic import BaseModel, field_validator
 
 from .citation import Citation
+from .file import GeneratedFile
 from .image import GeneratedImage, Image, WebImage
 from .research import DeepResearchDocument, DeepResearchPlan
 from .video import GeneratedMedia, GeneratedVideo
@@ -28,6 +29,9 @@ class Candidate(BaseModel):
         List of generated videos in reply, can be empty
     generated_media: `list[GeneratedMedia]`, optional
         List of generated media (music/audio) in reply, can be empty
+    generated_files: `list[GeneratedFile]`, optional
+        List of downloadable documents produced by code execution (spreadsheets, PDFs,
+        saved source files), can be empty
     citations: `list[Citation]`, optional
         Web sources resolving the `[cite: N]` markers in `text`, can be empty
     deep_research_plan: `DeepResearchPlan`, optional
@@ -46,6 +50,7 @@ class Candidate(BaseModel):
     generated_images: list[GeneratedImage] = []
     generated_videos: list[GeneratedVideo] = []
     generated_media: list[GeneratedMedia] = []
+    generated_files: list[GeneratedFile] = []
     citations: list[Citation] = []
     deep_research_plan: DeepResearchPlan | None = None
     deep_research_document: DeepResearchDocument | None = None
@@ -71,3 +76,13 @@ class Candidate(BaseModel):
     def images(self) -> list[Image]:
         images: list[Image] = [*self.web_images, *self.generated_images]
         return images
+
+    @property
+    def files(self) -> list[GeneratedFile]:
+        """Documents Gemini produced, excluding any already delivered as media.
+
+        A reply that renders a chart sends the chart through `generated_images` and names it
+        in a `sandbox:` placeholder; listing it again here would hand the caller the same
+        bytes twice under two different fields.
+        """
+        return [f for f in self.generated_files if not f.is_media]

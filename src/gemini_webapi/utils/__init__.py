@@ -16,6 +16,10 @@ from .parsing import (
 from .rotate_1psidts import clear_cookies_cache, rotate_1psidts, save_cookies
 from .upload_file import upload_file, parse_file_name
 from .citation import citation_numbers, extract_citations
+from .file_output import (
+    collect_generated_files,
+    collect_sandbox_names,
+)
 from .research import (
     extract_deep_research_document,
     extract_deep_research_plan,

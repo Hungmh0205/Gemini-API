@@ -1,0 +1,70 @@
+name: ci
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+# Offline hoàn toàn: test không được gọi Gemini, không đăng nhập Google, không
+# spawn Chrome agent. Mọi phụ thuộc mạng nằm ở bước cài đặt, còn bước test chỉ
+# chạy unittest với mock. Đây là ranh giới quan trọng — một test "xanh" nhờ gọi
+# mạng là test không kiểm chứng được gì.
+env:
+  GEMINI_API_KEY: ci-dummy-key-not-used-offline
+  PYTHONIOENCODING: utf-8
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      # requirements.txt giờ không còn marker `sys_platform` nào (đã bỏ hết gói
+      # chỉ-dùng-trên-Windows), nên cài một lần là đủ cho cả hai OS.
+      - name: Cài phụ thuộc
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Kiểm tra syntax (không cần dependency)
+        run: |
+          python -c "import ast, pathlib, sys; [ast.parse(p.read_text(encoding='utf-8-sig'), str(p)) for p in pathlib.Path('.').rglob('*.py') if 'venv' not in p.parts and 'python_portable' not in p.parts]; print('syntax OK')"
+
+      # `unittest discover` cần `tests/__init__.py`; repo không có file đó (test
+      # được chạy bằng đường dẫn module), nên liệt kê rõ từ module.
+      - name: Chạy test
+        run: |
+          python -m unittest discover -s tests -t . -p "test_*.py" -v
+
+      # Bộ render Markdown + toán học của chat.html. Node có sẵn trên runner
+      # GitHub nên không cần cài thêm gì; KaTeX nằm trong vendor/ nên test này
+      # cũng offline. Đọc thẳng chat.html nên sửa renderer mà quên test sẽ đỏ.
+      - name: Test render chat.html (Node)
+        run: node tests/render_test.js
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Ruff (lỗi thật: biến chưa định nghĩa, cú pháp)
+        # Chỉ bật nhóm "critical". Đây không phải vì repo lười lint — mà vì
+        # E/W/F đầy đủ sẽ báo hàng trăm lỗi style của cả codebase cũ, làm CI
+        # đỏ ngay từ commit đầu tiên và mất khả năng làm tín hiệu. Nhóm này bắt
+        # đúng loại lỗi đã từng xảy ra: `auth_watchdog` gán biến mà không có
+        # `global` -> UnboundLocalError ngay vòng lặp đầu, chết lặng lẽ.
+        run: |
+          python -m pip install --upgrade pip ruff
+          ruff check --select E9,F63,F7,F82,F821 .

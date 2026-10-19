@@ -3,7 +3,7 @@
 
 Ba việc:
 
-1. **Ghi log ra file.** `run_server.bat` in ra console và không redirect, nên
+1. **Ghi log ra file.** `run_server-debug.bat` in ra console và không redirect, nên
    muốn xem lại log hôm qua thì không có gì để xem. Ở đây thêm một file xoay
    vòng, không thay console.
 2. **Che bí mật trước khi hiện ra UI.** `gemini-auth.json` là phiên Google
